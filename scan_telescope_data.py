@@ -24,7 +24,10 @@ ASTROMETRY_NET_API_KEY = os.environ.get("ASTROMETRY_NET_API_KEY", "")
 MAX_ASTAP_ATTEMPTS = 3  # Files to try with ASTAP at each end of the session before using astrometry.net
 
 # Mount detection settings
-MOUNT_TOLERANCE_DEG = 3.0         # How closely observed and expected rotation must agree
+MOUNT_SAMPLE_FRAMES = 5           # Frames solved per directory, spread across the session
+FIT_TOLERANCE_DEG = 8.0           # A mount type fits if every sampled frame agrees within this
+REJECT_DEG = 10.0                 # The losing mount type must miss by at least this much
+REJECT_RATIO = 3.0                # ...and by at least this multiple of the winner's miss
 MIN_PREDICTED_ROTATION_DEG = 6.0  # Alt-az rotation needed over the session to tell the mounts apart
 MIN_SPAN_NO_LOCATION_MIN = 30.0   # Minimum session length to judge without a site location
 
@@ -140,48 +143,67 @@ def parallactic_angle_deg(ra_deg, dec_deg, lat_deg, lon_deg, obs_time):
     return float(np.degrees(q))
 
 
-def classify_mount(frame_a, frame_b):
-    """Decide the mount type from two solved frames.
+def classify_mount(frames):
+    """Decide the mount type from frames solved across a session.
 
-    Returns (mount_type, evidence) where mount_type is EQUATORIAL, ALT-AZ or INCONCLUSIVE.
+    Frames must be in time order and come from the same solver. Rotation of each frame
+    relative to the first is compared with two hypotheses:
+      equatorial: no change (or a change of exactly 180 degrees after a meridian flip)
+      alt-az:     the change in parallactic angle for that pointing, site and time
+    Sampling the middle of the session matters: near a meridian flip the alt-az
+    prediction can land close to 180 degrees, which looks like a flip at the two ends.
+
+    Returns (mount_type, evidence) with mount_type EQUATORIAL, ALT-AZ or INCONCLUSIVE.
     """
-    delta = wrap180(frame_b['rotation'] - frame_a['rotation'])
-    # Distance of the observed change from 0 or 180 degrees (a meridian flip adds 180)
-    equatorial_residual = abs((delta + 90.0) % 180.0 - 90.0)
+    if len(frames) < 2:
+        return "INCONCLUSIVE", "Fewer than two frames solved, so rotation change is unknown"
+    if len({f['solver'] for f in frames}) > 1:
+        return "INCONCLUSIVE", "Frames were solved by different solvers, so their rotations are not comparable"
 
-    t_a, t_b = frame_a.get('time'), frame_b.get('time')
-    span_min = (t_b - t_a).to(u.min).value if (t_a is not None and t_b is not None) else None
+    ref = frames[0]
+    times = [f.get('time') for f in frames]
+    have_times = all(t is not None for t in times)
+    span_min = (times[-1] - times[0]).to(u.min).value if have_times else None
     span_text = f"{span_min / 60.0:.1f} h" if span_min is not None else "unknown span"
 
-    lat, lon = get_site_location(frame_a['header'])
-    predicted = None
-    if lat is not None and lon is not None and span_min is not None:
-        q_a = parallactic_angle_deg(frame_a['ra'], frame_a['dec'], lat, lon, t_a)
-        q_b = parallactic_angle_deg(frame_b['ra'], frame_b['dec'], lat, lon, t_b)
-        predicted = wrap180(q_b - q_a)
+    observed = [wrap180(f['rotation'] - ref['rotation']) for f in frames[1:]]
+    # Distance of each observed change from 0 or 180 degrees (a meridian flip adds 180)
+    equatorial_miss = max(abs((d + 90.0) % 180.0 - 90.0) for d in observed)
 
-    if predicted is not None:
-        # Compare against both signs, since the rotation sign convention varies by solver
-        altaz_residual = min(abs(wrap180(delta - predicted)), abs(wrap180(delta + predicted)))
-        evidence = (f"rotation changed {delta:+.1f} deg over {span_text}; "
-                    f"alt-az would change {predicted:+.1f} deg")
+    lat, lon = get_site_location(ref['header'])
+    if lat is not None and lon is not None and have_times:
+        q_ref = parallactic_angle_deg(ref['ra'], ref['dec'], lat, lon, ref['time'])
+        predicted = [wrap180(parallactic_angle_deg(f['ra'], f['dec'], lat, lon, f['time']) - q_ref)
+                     for f in frames[1:]]
+        # The rotation sign convention varies by solver, so allow either sign (used consistently)
+        altaz_miss = min(
+            max(abs(wrap180(d - sign * p)) for d, p in zip(observed, predicted))
+            for sign in (1.0, -1.0)
+        )
+        evidence = (f"{len(frames)} frames over {span_text}; end-to-end rotation {observed[-1]:+.1f} deg, "
+                    f"alt-az predicts {predicted[-1]:+.1f} deg; worst miss: "
+                    f"equatorial {equatorial_miss:.1f} deg, alt-az {altaz_miss:.1f} deg")
 
-        if abs(predicted) < MIN_PREDICTED_ROTATION_DEG:
+        if max(abs(p) for p in predicted) < MIN_PREDICTED_ROTATION_DEG:
             return "INCONCLUSIVE", evidence + " (too little expected rotation to tell mounts apart)"
-        if equatorial_residual <= MOUNT_TOLERANCE_DEG and altaz_residual > MOUNT_TOLERANCE_DEG:
-            return "EQUATORIAL", evidence
-        if altaz_residual <= MOUNT_TOLERANCE_DEG and equatorial_residual > MOUNT_TOLERANCE_DEG:
-            return "ALT-AZ", evidence
-        return "INCONCLUSIVE", evidence + " (matches neither mount type)"
+
+        if equatorial_miss <= altaz_miss:
+            winner, winner_miss, loser_miss = "EQUATORIAL", equatorial_miss, altaz_miss
+        else:
+            winner, winner_miss, loser_miss = "ALT-AZ", altaz_miss, equatorial_miss
+
+        if winner_miss <= FIT_TOLERANCE_DEG and loser_miss >= max(REJECT_DEG, REJECT_RATIO * winner_miss):
+            return winner, evidence
+        return "INCONCLUSIVE", evidence + " (cannot separate the two mount types)"
 
     # No site location or times: judge from the observed change alone
-    evidence = (f"rotation changed {delta:+.1f} deg over {span_text}; "
-                f"no site location for an alt-az prediction")
+    evidence = (f"{len(frames)} frames over {span_text}; worst deviation from a fixed field "
+                f"{equatorial_miss:.1f} deg; no site location for an alt-az prediction")
     if span_min is None or span_min < MIN_SPAN_NO_LOCATION_MIN:
         return "INCONCLUSIVE", evidence + " (session too short to judge)"
-    if equatorial_residual <= MOUNT_TOLERANCE_DEG:
+    if equatorial_miss <= FIT_TOLERANCE_DEG:
         return "EQUATORIAL", evidence
-    if equatorial_residual > 3 * MOUNT_TOLERANCE_DEG:
+    if equatorial_miss >= 3 * FIT_TOLERANCE_DEG:
         return "ALT-AZ", evidence
     return "INCONCLUSIVE", evidence
 
@@ -653,8 +675,15 @@ def sort_files_by_time(files):
     return [path for _, path in keyed]
 
 
+def pick_sample_indices(count, wanted):
+    """Indices of `wanted` positions spread evenly from the first to the last of `count` items."""
+    if count <= wanted:
+        return list(range(count))
+    return sorted({round(i * (count - 1) / (wanted - 1)) for i in range(wanted)})
+
+
 def process_directory(lights_dir):
-    """Solve the first and last usable frames in a directory and classify the mount from the rotation change"""
+    """Solve frames spread across a session and classify the mount from how the rotation changes"""
     print(f"\n📁 Processing directory: {lights_dir}")
 
     fits_files = find_all_fits_files(lights_dir)
@@ -675,7 +704,7 @@ def process_directory(lights_dir):
     mount_type = "UNKNOWN"
     mount_evidence = "No frame could be plate solved"
     header_info = {}
-    solved_frames = []
+    frames = []
     attempts = 0
 
     # Solve near the start of the session
@@ -683,39 +712,59 @@ def process_directory(lights_dir):
     frame_a, n = solve_end(ordered, "first")
     attempts += n
 
-    # Solve near the end of the session, skipping the frame already solved
+    # Solve near the end, skipping the frame already solved
     frame_b = None
     if frame_a is not None:
-        solved_frames.append(frame_a)
+        frames.append(frame_a)
         later = [p for p in reversed(ordered) if p != frame_a['file']]
         if later:
             print("\n🔧 Solving a frame from the end of the session")
             frame_b, n = solve_end(later, "last")
             attempts += n
         if frame_b is not None:
-            solved_frames.append(frame_b)
+            frames.append(frame_b)
 
-    if frame_a is not None and frame_b is not None:
-        mount_type, mount_evidence = classify_mount(frame_a, frame_b)
+    # Solve frames in between so a meridian flip or a coincidental end-to-end match
+    # cannot be mistaken for the other mount type
+    if frame_a is not None and frame_b is not None \
+            and frame_a['solver'] == 'ASTAP' and frame_b['solver'] == 'ASTAP':
+        used = {frame_a['file'], frame_b['file']}
+        for idx in pick_sample_indices(len(ordered), MOUNT_SAMPLE_FRAMES)[1:-1]:
+            candidates = [p for p in ordered[idx: idx + MAX_ASTAP_ATTEMPTS] if p not in used]
+            print(f"\n🔧 Solving a frame from the middle of the session (position {idx + 1}/{len(ordered)})")
+            for path in candidates:
+                attempts += 1
+                mid = solve_frame(path)
+                if mid:
+                    frames.append(mid)
+                    used.add(path)
+                    break
+
+    frames.sort(key=lambda f: f['time'].jd if f['time'] is not None else float('inf'))
+
+    if len(frames) >= 2:
+        mount_type, mount_evidence = classify_mount(frames)
         print(f"\n  → Determined mount type: {mount_type}")
         print(f"    {mount_evidence}")
-    elif frame_a is not None:
+    elif len(frames) == 1:
         mount_type = "INCONCLUSIVE"
         mount_evidence = "Only one frame could be solved, so rotation change is unknown"
         print(f"\n  → {mount_evidence}")
     else:
         print("\n❌ Could not plate solve any files in this directory")
 
-    # Header info from the first solved frame, else from the first file
-    if frame_a is not None:
-        header_info = extract_header_info(frame_a['header'])
+    # Header info from the earliest solved frame, else from the first file
+    if frames:
+        header_info = extract_header_info(frames[0]['header'])
     else:
         try:
             header_info = extract_header_info(fits.getheader(ordered[0]))
         except Exception:
             header_info = {}
 
-    solvers = sorted({f['solver'] for f in solved_frames})
+    solvers = sorted({f['solver'] for f in frames})
+    solved_files = [os.path.basename(frames[0]['file']), os.path.basename(frames[-1]['file'])] if len(frames) >= 2 \
+        else [os.path.basename(f['file']) for f in frames]
 
     return {
         'directory': lights_dir,
@@ -729,7 +778,7 @@ def process_directory(lights_dir):
         'instrument': header_info.get('instrument', 'Unknown'),
         'latitude': header_info.get('latitude', 'Unknown'),
         'longitude': header_info.get('longitude', 'Unknown'),
-        'solved_files': [os.path.basename(f['file']) for f in solved_frames],
+        'solved_files': solved_files,
         'solver_used': '+'.join(solvers) if solvers else 'NONE',
         'attempts_made': attempts,
         'total_attempts': len(fits_files)
@@ -920,8 +969,9 @@ def main():
         print("Example: python scan_telescope_data.py /home/brian/nina")
         print("This will walk through all subdirectories and process FITS files")
         print("from each 'light' or 'lights' directory found (any case).")
-        print("\nThe mount type is judged by solving the first and last frame of each")
-        print("directory and comparing how the field rotation changed between them.")
+        print("\nThe mount type is judged by solving frames spread across each directory's")
+        print("session and comparing how the field rotation changed with what an alt-az")
+        print("mount would produce at that site and time.")
         print("\nOptional environment variables:")
         print("  ASTROMETRY_NET_API_KEY   fallback solver key from https://nova.astrometry.net/api_help")
         print("  SITE_LATITUDE / SITE_LONGITUDE   site location (east positive) when headers lack it")
@@ -945,7 +995,7 @@ def main():
 
     print("\nTelescope Mount Analysis")
     print("=" * 120)
-    print(f"Solves a frame at each end of every session (up to {MAX_ASTAP_ATTEMPTS} ASTAP tries per end, then one astrometry.net try)")
+    print(f"Solves up to {MOUNT_SAMPLE_FRAMES} frames spread across each session (ASTAP, with one astrometry.net try at each end if ASTAP fails)")
     print("Directories with no FITS files will be excluded from output")
 
     for lights_dir in sorted(lights_dirs):
