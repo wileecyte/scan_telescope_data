@@ -762,34 +762,77 @@ def frame_sort_key(frame):
     return frame['time'].jd if frame['time'] is not None else float('inf')
 
 
-def process_directory(lights_dir):
-    """Solve frames from one observing session in a directory and classify the mount.
+FILTER_FILENAME_PATTERNS = [
+    # NINA: 2026-08-16_03-52-56_Lum_0.00_60.00s_0000.fits (the filter can contain spaces or be empty)
+    re.compile(r'^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_(?P<filter>.*?)_-?\d+(?:\.\d+)?_\d+(?:\.\d+)?s_\d+',
+               re.IGNORECASE),
+    # Seestar: Light_M33_20.0s_IRCUT_20251218-193902.fit, with an optional "_failed" before the time stamp
+    re.compile(r'_\d+(?:\.\d+)?s_(?P<filter>[^_]+?)(?:_failed)?_\d{8}-\d{6}\.fits?$', re.IGNORECASE),
+]
+NO_FILTER_LABEL = "(none)"
+
+
+def filter_from_filename(path):
+    """Filter name embedded in a file name, or None when the name has no recognized pattern."""
+    name = os.path.basename(path)
+    for pattern in FILTER_FILENAME_PATTERNS:
+        match = pattern.search(name)
+        if match:
+            return match.group('filter').strip() or NO_FILTER_LABEL
+    return None
+
+
+def filter_from_header(header):
+    """Filter name from the FITS header."""
+    for key in ('FILTER', 'FILT', 'FILTER1', 'FILTER2'):
+        if key in header:
+            value = str(header[key]).strip()
+            if value:
+                return value
+    return NO_FILTER_LABEL
+
+
+def assign_filters(paths):
+    """Map each path to its filter name, from the file name when possible, else from the FITS header."""
+    result = {}
+    unrecognized = []
+    for path in paths:
+        name = filter_from_filename(path)
+        if name is None:
+            unrecognized.append(path)
+        else:
+            result[path] = name
+    if unrecognized:
+        print(f"  Reading the filter from the FITS header of {len(unrecognized)} file(s) whose names do not contain it...")
+        for path in unrecognized:
+            try:
+                result[path] = filter_from_header(fits.getheader(path))
+            except Exception:
+                result[path] = "Unknown"
+    return result
+
+
+def process_session(lights_dir, session, index, total):
+    """Solve frames from one observing session and classify the mount.
 
     Solves one frame at each end of the session. Only when that is ambiguous does it
-    solve frames in between.
+    solve frames in between. Every filter shot during the session shares the verdict,
+    since the filters are interleaved within the same night's mount setup.
     """
-    print(f"\n📁 Processing directory: {lights_dir}")
+    if total > 1:
+        print(f"\n📅 Session {index} of {total}: {len(session)} frames")
 
-    fits_files = find_all_fits_files(lights_dir)
+    filters = assign_filters(session)
+    filter_exposure_counts = {}
+    for path in session:
+        key = (filters[path], extract_exposure_from_filename(path))
+        filter_exposure_counts[key] = filter_exposure_counts.get(key, 0) + 1
 
-    if not fits_files:
-        print(f"❌ No FITS files found in {lights_dir} - skipping directory")
-        return None
+    print(f"📄 {len(session)} FITS file(s) in this session")
+    print("📊 Filter and exposure distribution:")
+    for (flt, exp), count in sorted(filter_exposure_counts.items()):
+        print(f"      {flt} {exp}: {count} frames")
 
-    exposure_counts, total_files = analyze_exposure_distribution(lights_dir)
-
-    print(f"📄 Found {len(fits_files)} FITS file(s) total")
-    print("📊 Exposure distribution:")
-    for exp, count in sorted(exposure_counts.items()):
-        print(f"      {exp}: {count} frames")
-
-    # Work within the largest observing session so frames from different nights are not compared
-    sessions = split_sessions(order_frames(fits_files))
-    session = max(sessions, key=len)
-    session_note = ""
-    if len(sessions) > 1:
-        session_note = f"largest of {len(sessions)} sessions ({len(session)} of {len(fits_files)} frames); "
-        print(f"📅 Directory holds {len(sessions)} separate sessions, using the largest ({len(session)} frames)")
     ordered = prefer_usable(session)
 
     mount_type = "UNKNOWN"
@@ -845,7 +888,7 @@ def process_directory(lights_dir):
         mount_evidence = "Only one frame could be solved, so rotation change is unknown"
         print(f"\n  → {mount_evidence}")
     else:
-        print("\n❌ Could not plate solve any files in this directory")
+        print("\n❌ Could not plate solve any files in this session")
 
     # Header info from the earliest solved frame, else from the first file
     if frames:
@@ -864,12 +907,12 @@ def process_directory(lights_dir):
 
     return {
         'directory': lights_dir,
+        'session': f"{index}/{total}",
         'mount_type': mount_type,
-        'mount_evidence': session_note + mount_evidence,
-        'total_files': total_files,
-        'exposure_counts': exposure_counts,
+        'mount_evidence': mount_evidence,
+        'total_files': len(session),
+        'filter_exposure_counts': filter_exposure_counts,
         'target': header_info.get('target', 'Unknown'),
-        'filter': header_info.get('filter', 'Unknown'),
         'date': header_info.get('date_obs', 'Unknown'),
         'instrument': header_info.get('instrument', 'Unknown'),
         'latitude': header_info.get('latitude', 'Unknown'),
@@ -877,8 +920,30 @@ def process_directory(lights_dir):
         'solved_files': solved_files,
         'solver_used': '+'.join(solvers) if solvers else 'NONE',
         'attempts_made': attempts,
-        'total_attempts': len(fits_files)
+        'total_attempts': len(session)
     }
+
+
+def process_directory(lights_dir):
+    """Split a directory into observing sessions and process each. Returns a list of session results."""
+    print(f"\n📁 Processing directory: {lights_dir}")
+
+    fits_files = find_all_fits_files(lights_dir)
+
+    if not fits_files:
+        print(f"❌ No FITS files found in {lights_dir} - skipping directory")
+        return []
+
+    print(f"📄 Found {len(fits_files)} FITS file(s) total")
+
+    # Frames separated by a long gap are different sessions (different nights, or a
+    # mount change in between), so each is classified on its own
+    sessions = split_sessions(order_frames(fits_files))
+    if len(sessions) > 1:
+        print(f"📅 Directory holds {len(sessions)} separate sessions (gap of {SESSION_GAP_HOURS:g} h or more)")
+
+    return [process_session(lights_dir, session, i, len(sessions))
+            for i, session in enumerate(sessions, 1)]
 
 
 # ---------------------------------------------------------------------------
@@ -1042,7 +1107,8 @@ def group_similar_objects(results):
 
         group = object_groups[normalized]
         group['original_names'].add(target)
-        group['directories'].append(result['directory'])
+        if result['directory'] not in group['directories']:
+            group['directories'].append(result['directory'])
         group['mount_types'].add(result['mount_type'])
         group['total_files'] += result['total_files']
 
@@ -1065,9 +1131,10 @@ def main():
         print("Example: python scan_telescope_data.py /home/brian/nina")
         print("This will walk through all subdirectories and process FITS files")
         print("from each 'light' or 'lights' directory found (any case).")
-        print("\nThe mount type is judged by solving frames from the largest session in each")
-        print("directory and comparing how the field rotation changed with what an alt-az")
-        print("mount would produce at that site and time.")
+        print("\nThe mount type is judged separately for each observing session (a gap of")
+        print(f"{SESSION_GAP_HOURS:g} hours or more between frames starts a new one) by solving frames")
+        print("from it and comparing how the field rotation changed with what an alt-az mount")
+        print("would produce at that site and time. CSV rows are split by filter and exposure.")
         print("\nOptional environment variables:")
         print("  ASTROMETRY_NET_API_KEY   fallback solver key from https://nova.astrometry.net/api_help")
         print("  SITE_LATITUDE / SITE_LONGITUDE   site location (east positive) when headers lack it")
@@ -1091,13 +1158,11 @@ def main():
 
     print("\nTelescope Mount Analysis")
     print("=" * 120)
-    print(f"Solves one frame at each end of each directory's largest session; up to {MOUNT_SAMPLE_FRAMES} frames only when that is ambiguous")
+    print(f"Solves one frame at each end of each session; up to {MOUNT_SAMPLE_FRAMES} frames only when that is ambiguous")
     print("Directories with no FITS files will be excluded from output")
 
     for lights_dir in sorted(lights_dirs):
-        result = process_directory(lights_dir)
-        if result is not None:
-            results.append(result)
+        results.extend(process_directory(lights_dir))
 
     if not results:
         print("\n❌ No directories with FITS files found!")
@@ -1114,7 +1179,6 @@ def main():
         mosaic_info = result.get('mosaic_info', {})
         is_mosaic = result.get('is_mosaic', False)
         mount_type = result['mount_type']
-        filter_val = result['filter']
         date = result['date']
         directory = result['directory']
         latitude = result['latitude']
@@ -1129,7 +1193,7 @@ def main():
                 panel_info += f" of {mosaic_info['total_panels']}"
             mosaic_detail = panel_info
 
-        exposures = sorted(result['exposure_counts'].items())
+        groups = sorted(result['filter_exposure_counts'].items())
 
         display_target = target
         if is_mosaic:
@@ -1147,7 +1211,7 @@ def main():
             'Mosaic Details': mosaic_detail,
             'Mount Type': mount_type,
             'Mount Evidence': result.get('mount_evidence', ''),
-            'Filter': filter_val,
+            'Session': result.get('session', '1/1'),
             'Date': date,
             'Directory': directory,
             'Latitude': latitude,
@@ -1159,14 +1223,16 @@ def main():
             'Attempts': f"{result.get('attempts_made', 0)}/{result.get('total_attempts', 0)}"
         }
 
-        if exposures:
-            for exp, count in exposures:
+        if groups:
+            for (filter_name, exp), count in groups:
                 row = dict(base_row)
+                row['Filter'] = filter_name
                 row['Exposure'] = exp
                 row['Frames'] = count
                 all_rows.append(row)
         else:
             row = dict(base_row)
+            row['Filter'] = 'Unknown'
             row['Exposure'] = 'No data'
             row['Frames'] = result['total_files']
             all_rows.append(row)
@@ -1174,10 +1240,10 @@ def main():
     print("\n" + "=" * 120)
     print("SUMMARY")
     print("=" * 120)
-    print(f"Showing {len(results)} directories with FITS files")
+    print(f"Showing {len(results)} sessions from {len({r['directory'] for r in results})} directories with FITS files")
 
     print("\n📊 OBJECT GROUPING SUMMARY:")
-    print(f"Found {len(object_groups)} unique objects from {len(results)} directories")
+    print(f"Found {len(object_groups)} unique objects from {len({r['directory'] for r in results})} directories")
 
     mosaic_objects = 0
     for norm_name, group in sorted(object_groups.items()):
@@ -1198,7 +1264,7 @@ def main():
     if mosaic_objects > 0:
         print(f"\n🧩 Found {mosaic_objects} objects with mosaic panels")
 
-    header = f"{'Target':<25} {'Normalized':<15} {'Catalog':<10} {'Mosaic':<6} {'Mount':<13} {'Filter':<8} {'Date':<15} {'Solver':<12} {'Directory'}"
+    header = f"{'Target':<25} {'Normalized':<15} {'Catalog':<10} {'Mosaic':<6} {'Mount':<13} {'Filter':<16} {'Date':<15} {'Solver':<12} {'Directory'}"
     print(f"\n{'=' * 120}")
     print("DETAILED RESULTS")
     print("=" * 120)
@@ -1207,13 +1273,13 @@ def main():
 
     for row in all_rows:
         mosaic_indicator = "🧩" if row['Is Mosaic'] == "Yes" else "  "
-        print(f"{row['Target']:<25} {row['Normalized Name']:<15} {row['Catalog Type']:<10} {mosaic_indicator:<6} {row['Mount Type']:<13} {row['Filter']:<8} {row['Date']:<15} {row['Solver Used']:<12} {row['Directory']}")
+        print(f"{row['Target']:<25} {row['Normalized Name']:<15} {row['Catalog Type']:<10} {mosaic_indicator:<6} {row['Mount Type']:<13} {row['Filter']:<16} {row['Date']:<15} {row['Solver Used']:<12} {row['Directory']}")
 
     csv_filename = "telescope_analysis.csv"
     try:
         with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = ['Target', 'Normalized Name', 'Catalog Type', 'Is Mosaic', 'Mosaic Details',
-                          'Mount Type', 'Mount Evidence', 'Filter', 'Date', 'Exposure', 'Frames',
+                          'Mount Type', 'Mount Evidence', 'Filter', 'Session', 'Date', 'Exposure', 'Frames',
                           'Directory', 'Latitude', 'Longitude', 'Total Files', 'Instrument',
                           'Solved File', 'Solver Used', 'Attempts']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -1234,13 +1300,13 @@ def main():
 
         mosaic_dirs = sum(1 for r in results if r.get('is_mosaic', False))
 
-        print(f"📈 Mount classified: {classified}/{total_dirs_with_files} directories "
+        print(f"📈 Mount classified: {classified}/{total_dirs_with_files} sessions "
               f"({inconclusive} inconclusive, {unsolved} could not be plate solved)")
-        print(f"🔧 Solvers used: {astap_dirs} directories with ASTAP, {astrometry_dirs} with astrometry.net")
-        print(f"🧩 Mosaic directories: {mosaic_dirs}/{total_dirs_with_files}")
+        print(f"🔧 Solvers used: {astap_dirs} sessions with ASTAP, {astrometry_dirs} with astrometry.net")
+        print(f"🧩 Mosaic sessions: {mosaic_dirs}/{total_dirs_with_files}")
 
         total_lights_dirs_found = len(lights_dirs)
-        dirs_with_files = len(results)
+        dirs_with_files = len({r['directory'] for r in results})
         dirs_without_files = total_lights_dirs_found - dirs_with_files
         print(f"📁 Directories: {total_lights_dirs_found} total, {dirs_with_files} with FITS files, {dirs_without_files} without FITS files (excluded)")
 
