@@ -29,9 +29,10 @@ SESSION_GAP_HOURS = 6.0  # A gap this long between frames starts a new observing
 # Mount detection settings
 MOUNT_SAMPLE_FRAMES = 5           # Total frames solved when the two ends are ambiguous
 FIT_TOLERANCE_DEG = 8.0           # A mount type fits if every sampled frame agrees within this
-REJECT_DEG = 5.0                  # The losing mount type must miss by at least this much (solves agree to ~0.3 deg)
+REJECT_DEG = 2.0                  # The losing mount type must miss by at least this much (solves agree to ~0.3 deg)
 REJECT_RATIO = 3.0                # ...and by at least this multiple of the winner's miss
-MIN_PREDICTED_ROTATION_DEG = 6.0  # Alt-az rotation needed over the session to tell the mounts apart
+MIN_PREDICTED_ROTATION_DEG = 2.0  # Alt-az rotation needed over the session to tell the mounts apart
+MIN_SWEEP_DEG = 6.0               # Mid-session swing in alt-az rotation that justifies solving extra frames
 MIN_SPAN_NO_LOCATION_MIN = 30.0   # Minimum session length to judge without a site location
 
 # Used only when the FITS headers have no site location (east longitude positive):
@@ -189,21 +190,29 @@ def classify_mount(frames):
                     f"alt-az predicts {predicted[-1]:+.1f} deg; worst miss: "
                     f"equatorial {equatorial_miss:.1f} deg, alt-az {altaz_miss:.1f} deg")
 
+        # The prediction at the solved frames can be small even when the session sweeps
+        # through a larger angle in between (an alt-az session symmetric about the
+        # meridian ends at nearly the angle it started at). Extra frames only help when
+        # that swing is large, so check the points in between.
+        span = times[-1] - times[0]
+        sweep = max(
+            abs(wrap180(parallactic_angle_deg(ref['ra'], ref['dec'], lat, lon, times[0] + span * (k / 8.0)) - q_ref))
+            for k in range(1, 8)
+        )
+        more_frames_help = sweep >= MIN_SWEEP_DEG and len(frames) < MOUNT_SAMPLE_FRAMES
+
         if max(abs(p) for p in predicted) < MIN_PREDICTED_ROTATION_DEG:
-            # The prediction at the solved frames can be small even when the session sweeps
-            # through a larger angle in between (an alt-az session symmetric about the
-            # meridian ends at nearly the angle it started at). Check the points in between.
-            span = times[-1] - times[0]
-            sweep = max(
-                abs(wrap180(parallactic_angle_deg(ref['ra'], ref['dec'], lat, lon, times[0] + span * (k / 8.0)) - q_ref))
-                for k in range(1, 8)
-            )
-            if sweep >= MIN_PREDICTED_ROTATION_DEG and len(frames) < MOUNT_SAMPLE_FRAMES:
+            if more_frames_help:
                 return ("INCONCLUSIVE",
                         evidence + f" (ends show little alt-az rotation but the session passes through "
                                    f"{sweep:.0f} deg in between)", True)
             return ("INCONCLUSIVE",
                     evidence + " (too little expected rotation to tell mounts apart)", False)
+
+        # An end-to-end change near 180 degrees is what a meridian flip produces, and an
+        # alt-az mount can land there by coincidence. Only frames in between can tell which.
+        if more_frames_help and any(abs(abs(d) - 180.0) <= 15.0 for d in observed):
+            return "INCONCLUSIVE", evidence + " (end-to-end change is near 180 degrees)", True
 
         if equatorial_miss <= altaz_miss:
             winner, winner_miss, loser_miss = "EQUATORIAL", equatorial_miss, altaz_miss
@@ -215,7 +224,7 @@ def classify_mount(frames):
         # More frames only help when both hypotheses fit the ends (for example an alt-az
         # rotation near 180 degrees that looks like a meridian flip)
         both_fit = equatorial_miss <= FIT_TOLERANCE_DEG and altaz_miss <= FIT_TOLERANCE_DEG
-        return "INCONCLUSIVE", evidence + " (cannot separate the two mount types)", both_fit
+        return "INCONCLUSIVE", evidence + " (cannot separate the two mount types)", both_fit and more_frames_help
 
     # No site location or times: judge from the observed change alone
     evidence = (f"{len(frames)} frames over {span_text}; worst deviation from a fixed field "
