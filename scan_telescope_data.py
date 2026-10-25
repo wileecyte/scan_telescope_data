@@ -14,6 +14,7 @@ import time
 import tempfile
 import requests
 import json
+from datetime import datetime, timedelta
 
 # Configuration
 ASTAP_PATH = r"/usr/bin/astap"
@@ -22,11 +23,13 @@ ASTAP_DATABASE = r"/usr/share/astap/data"
 #   export ASTROMETRY_NET_API_KEY="your key from nova.astrometry.net"
 ASTROMETRY_NET_API_KEY = os.environ.get("ASTROMETRY_NET_API_KEY", "")
 MAX_ASTAP_ATTEMPTS = 3  # Files to try with ASTAP at each end of the session before using astrometry.net
+ASTAP_TIMEOUT_SEC = 60  # A solve that takes longer than this is abandoned
+SESSION_GAP_HOURS = 6.0  # A gap this long between frames starts a new observing session
 
 # Mount detection settings
-MOUNT_SAMPLE_FRAMES = 5           # Frames solved per directory, spread across the session
+MOUNT_SAMPLE_FRAMES = 5           # Total frames solved when the two ends are ambiguous
 FIT_TOLERANCE_DEG = 8.0           # A mount type fits if every sampled frame agrees within this
-REJECT_DEG = 10.0                 # The losing mount type must miss by at least this much
+REJECT_DEG = 5.0                  # The losing mount type must miss by at least this much (solves agree to ~0.3 deg)
 REJECT_RATIO = 3.0                # ...and by at least this multiple of the winner's miss
 MIN_PREDICTED_ROTATION_DEG = 6.0  # Alt-az rotation needed over the session to tell the mounts apart
 MIN_SPAN_NO_LOCATION_MIN = 30.0   # Minimum session length to judge without a site location
@@ -150,15 +153,17 @@ def classify_mount(frames):
     relative to the first is compared with two hypotheses:
       equatorial: no change (or a change of exactly 180 degrees after a meridian flip)
       alt-az:     the change in parallactic angle for that pointing, site and time
-    Sampling the middle of the session matters: near a meridian flip the alt-az
-    prediction can land close to 180 degrees, which looks like a flip at the two ends.
+    With only the two ends of a session, the alt-az prediction can land close to 180
+    degrees and look like a meridian flip; frames in between settle that.
 
-    Returns (mount_type, evidence) with mount_type EQUATORIAL, ALT-AZ or INCONCLUSIVE.
+    Returns (mount_type, evidence, ambiguous). mount_type is EQUATORIAL, ALT-AZ or
+    INCONCLUSIVE. ambiguous is True only when solving more frames could help.
     """
     if len(frames) < 2:
-        return "INCONCLUSIVE", "Fewer than two frames solved, so rotation change is unknown"
+        return "INCONCLUSIVE", "Fewer than two frames solved, so rotation change is unknown", False
     if len({f['solver'] for f in frames}) > 1:
-        return "INCONCLUSIVE", "Frames were solved by different solvers, so their rotations are not comparable"
+        return ("INCONCLUSIVE",
+                "Frames were solved by different solvers, so their rotations are not comparable", False)
 
     ref = frames[0]
     times = [f.get('time') for f in frames]
@@ -185,7 +190,20 @@ def classify_mount(frames):
                     f"equatorial {equatorial_miss:.1f} deg, alt-az {altaz_miss:.1f} deg")
 
         if max(abs(p) for p in predicted) < MIN_PREDICTED_ROTATION_DEG:
-            return "INCONCLUSIVE", evidence + " (too little expected rotation to tell mounts apart)"
+            # The prediction at the solved frames can be small even when the session sweeps
+            # through a larger angle in between (an alt-az session symmetric about the
+            # meridian ends at nearly the angle it started at). Check the points in between.
+            span = times[-1] - times[0]
+            sweep = max(
+                abs(wrap180(parallactic_angle_deg(ref['ra'], ref['dec'], lat, lon, times[0] + span * (k / 8.0)) - q_ref))
+                for k in range(1, 8)
+            )
+            if sweep >= MIN_PREDICTED_ROTATION_DEG and len(frames) < MOUNT_SAMPLE_FRAMES:
+                return ("INCONCLUSIVE",
+                        evidence + f" (ends show little alt-az rotation but the session passes through "
+                                   f"{sweep:.0f} deg in between)", True)
+            return ("INCONCLUSIVE",
+                    evidence + " (too little expected rotation to tell mounts apart)", False)
 
         if equatorial_miss <= altaz_miss:
             winner, winner_miss, loser_miss = "EQUATORIAL", equatorial_miss, altaz_miss
@@ -193,19 +211,22 @@ def classify_mount(frames):
             winner, winner_miss, loser_miss = "ALT-AZ", altaz_miss, equatorial_miss
 
         if winner_miss <= FIT_TOLERANCE_DEG and loser_miss >= max(REJECT_DEG, REJECT_RATIO * winner_miss):
-            return winner, evidence
-        return "INCONCLUSIVE", evidence + " (cannot separate the two mount types)"
+            return winner, evidence, False
+        # More frames only help when both hypotheses fit the ends (for example an alt-az
+        # rotation near 180 degrees that looks like a meridian flip)
+        both_fit = equatorial_miss <= FIT_TOLERANCE_DEG and altaz_miss <= FIT_TOLERANCE_DEG
+        return "INCONCLUSIVE", evidence + " (cannot separate the two mount types)", both_fit
 
     # No site location or times: judge from the observed change alone
     evidence = (f"{len(frames)} frames over {span_text}; worst deviation from a fixed field "
                 f"{equatorial_miss:.1f} deg; no site location for an alt-az prediction")
     if span_min is None or span_min < MIN_SPAN_NO_LOCATION_MIN:
-        return "INCONCLUSIVE", evidence + " (session too short to judge)"
+        return "INCONCLUSIVE", evidence + " (session too short to judge)", False
     if equatorial_miss <= FIT_TOLERANCE_DEG:
-        return "EQUATORIAL", evidence
+        return "EQUATORIAL", evidence, False
     if equatorial_miss >= 3 * FIT_TOLERANCE_DEG:
-        return "ALT-AZ", evidence
-    return "INCONCLUSIVE", evidence
+        return "ALT-AZ", evidence, False
+    return "INCONCLUSIVE", evidence, False
 
 
 # ---------------------------------------------------------------------------
@@ -393,8 +414,9 @@ def run_astap_solve(filename, ra_hours=None, dec_degrees=None):
                 cmd.extend(['-ra', f"{ra_hours:.6f}", '-spd', f"{dec_degrees + 90:.6f}"])
 
             print(f"    Command: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            print(f"    Return code: {result.returncode}")
+            started = time.time()
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=ASTAP_TIMEOUT_SEC)
+            print(f"    Return code: {result.returncode} ({time.time() - started:.1f} s)")
 
             ini_path = base + ".ini"
             if not os.path.exists(ini_path):
@@ -413,7 +435,7 @@ def run_astap_solve(filename, ra_hours=None, dec_degrees=None):
             return {'ra': ra, 'dec': dec, 'rotation': rotation}, rotation
 
     except subprocess.TimeoutExpired:
-        print("    ✗ ASTAP timed out")
+        print(f"    ✗ ASTAP timed out after {ASTAP_TIMEOUT_SEC} s")
     except Exception as e:
         print(f"    ✗ ASTAP error: {e}")
     return None, None
@@ -659,20 +681,74 @@ def find_all_fits_files(directory):
     return sorted(fits_files) if fits_files else []
 
 
-def sort_files_by_time(files):
-    """Order files by DATE-OBS, falling back to file name for files without a readable time."""
-    keyed = []
+FILENAME_TIME_PATTERNS = [
+    re.compile(r'(\d{4})(\d{2})(\d{2})[-_T](\d{2})(\d{2})(\d{2})'),      # 20260101-022917 (Seestar)
+    re.compile(r'(\d{4})-(\d{2})-(\d{2})[_T ](\d{2})-(\d{2})-(\d{2})'),  # 2026-08-16_03-52-56 (NINA)
+]
+
+
+def time_from_filename(path):
+    """Timestamp embedded in a file name, or None. Only used for ordering and gap detection."""
+    name = os.path.basename(path)
+    for pattern in FILENAME_TIME_PATTERNS:
+        match = pattern.search(name)
+        if match:
+            try:
+                return datetime(*(int(g) for g in match.groups()))
+            except ValueError:
+                continue
+    return None
+
+
+def order_frames(files):
+    """Return [(datetime or None, path)] in time order.
+
+    Uses the timestamp in each file name when every file has one, which avoids opening
+    thousands of FITS files. Otherwise reads DATE-OBS from each header.
+    """
+    stamped = [(time_from_filename(p), p) for p in files]
+    if all(t is not None for t, _ in stamped):
+        return sorted(stamped, key=lambda item: (item[0], item[1]))
+
+    print("  File names lack timestamps, reading FITS headers to order frames...")
+    from_headers = []
     for path in files:
-        jd = float('inf')
+        stamp = None
         try:
-            t = get_frame_time(fits.getheader(path))
-            if t is not None:
-                jd = t.jd
+            obs_time = get_frame_time(fits.getheader(path))
+            if obs_time is not None:
+                stamp = obs_time.to_datetime()
         except Exception:
             pass
-        keyed.append((jd, path))
-    keyed.sort(key=lambda item: (item[0], item[1]))
-    return [path for _, path in keyed]
+        from_headers.append((stamp, path))
+    return sorted(from_headers, key=lambda item: (item[0] is None, item[0] or datetime.min, item[1]))
+
+
+def split_sessions(ordered, gap_hours=SESSION_GAP_HOURS):
+    """Split time-ordered [(datetime, path)] into sessions wherever the gap exceeds gap_hours."""
+    sessions = []
+    current = []
+    previous = None
+    for stamp, path in ordered:
+        if current and stamp is not None and previous is not None \
+                and (stamp - previous) > timedelta(hours=gap_hours):
+            sessions.append(current)
+            current = []
+        current.append(path)
+        if stamp is not None:
+            previous = stamp
+    if current:
+        sessions.append(current)
+    return sessions
+
+
+def prefer_usable(paths):
+    """Prefer files without 'failed' in the name (Seestar appears to use it for rejected frames).
+
+    Falls back to every file when fewer than two others remain.
+    """
+    usable = [p for p in paths if 'failed' not in os.path.basename(p).lower()]
+    return usable if len(usable) >= 2 else paths
 
 
 def pick_sample_indices(count, wanted):
@@ -682,8 +758,16 @@ def pick_sample_indices(count, wanted):
     return sorted({round(i * (count - 1) / (wanted - 1)) for i in range(wanted)})
 
 
+def frame_sort_key(frame):
+    return frame['time'].jd if frame['time'] is not None else float('inf')
+
+
 def process_directory(lights_dir):
-    """Solve frames spread across a session and classify the mount from how the rotation changes"""
+    """Solve frames from one observing session in a directory and classify the mount.
+
+    Solves one frame at each end of the session. Only when that is ambiguous does it
+    solve frames in between.
+    """
     print(f"\n📁 Processing directory: {lights_dir}")
 
     fits_files = find_all_fits_files(lights_dir)
@@ -699,7 +783,14 @@ def process_directory(lights_dir):
     for exp, count in sorted(exposure_counts.items()):
         print(f"      {exp}: {count} frames")
 
-    ordered = sort_files_by_time(fits_files)
+    # Work within the largest observing session so frames from different nights are not compared
+    sessions = split_sessions(order_frames(fits_files))
+    session = max(sessions, key=len)
+    session_note = ""
+    if len(sessions) > 1:
+        session_note = f"largest of {len(sessions)} sessions ({len(session)} of {len(fits_files)} frames); "
+        print(f"📅 Directory holds {len(sessions)} separate sessions, using the largest ({len(session)} frames)")
+    ordered = prefer_usable(session)
 
     mount_type = "UNKNOWN"
     mount_evidence = "No frame could be plate solved"
@@ -724,26 +815,29 @@ def process_directory(lights_dir):
         if frame_b is not None:
             frames.append(frame_b)
 
-    # Solve frames in between so a meridian flip or a coincidental end-to-end match
-    # cannot be mistaken for the other mount type
-    if frame_a is not None and frame_b is not None \
-            and frame_a['solver'] == 'ASTAP' and frame_b['solver'] == 'ASTAP':
-        used = {frame_a['file'], frame_b['file']}
-        for idx in pick_sample_indices(len(ordered), MOUNT_SAMPLE_FRAMES)[1:-1]:
-            candidates = [p for p in ordered[idx: idx + MAX_ASTAP_ATTEMPTS] if p not in used]
-            print(f"\n🔧 Solving a frame from the middle of the session (position {idx + 1}/{len(ordered)})")
-            for path in candidates:
-                attempts += 1
-                mid = solve_frame(path)
-                if mid:
-                    frames.append(mid)
-                    used.add(path)
-                    break
-
-    frames.sort(key=lambda f: f['time'].jd if f['time'] is not None else float('inf'))
+    frames.sort(key=frame_sort_key)
 
     if len(frames) >= 2:
-        mount_type, mount_evidence = classify_mount(frames)
+        mount_type, mount_evidence, ambiguous = classify_mount(frames)
+
+        # An end-to-end rotation near 180 degrees fits both a meridian flip and an alt-az
+        # mount, so solve frames in between to separate them
+        if ambiguous and all(f['solver'] == 'ASTAP' for f in frames):
+            print("\n  → The two ends cannot separate the mount types, solving frames in between")
+            used = {f['file'] for f in frames}
+            for idx in pick_sample_indices(len(ordered), MOUNT_SAMPLE_FRAMES)[1:-1]:
+                candidates = [p for p in ordered[idx: idx + MAX_ASTAP_ATTEMPTS] if p not in used]
+                print(f"\n🔧 Solving a frame from the middle of the session (position {idx + 1}/{len(ordered)})")
+                for path in candidates:
+                    attempts += 1
+                    mid = solve_frame(path)
+                    if mid:
+                        frames.append(mid)
+                        used.add(path)
+                        break
+            frames.sort(key=frame_sort_key)
+            mount_type, mount_evidence, _ = classify_mount(frames)
+
         print(f"\n  → Determined mount type: {mount_type}")
         print(f"    {mount_evidence}")
     elif len(frames) == 1:
@@ -763,13 +857,15 @@ def process_directory(lights_dir):
             header_info = {}
 
     solvers = sorted({f['solver'] for f in frames})
-    solved_files = [os.path.basename(frames[0]['file']), os.path.basename(frames[-1]['file'])] if len(frames) >= 2 \
-        else [os.path.basename(f['file']) for f in frames]
+    if len(frames) >= 2:
+        solved_files = [os.path.basename(frames[0]['file']), os.path.basename(frames[-1]['file'])]
+    else:
+        solved_files = [os.path.basename(f['file']) for f in frames]
 
     return {
         'directory': lights_dir,
         'mount_type': mount_type,
-        'mount_evidence': mount_evidence,
+        'mount_evidence': session_note + mount_evidence,
         'total_files': total_files,
         'exposure_counts': exposure_counts,
         'target': header_info.get('target', 'Unknown'),
@@ -969,8 +1065,8 @@ def main():
         print("Example: python scan_telescope_data.py /home/brian/nina")
         print("This will walk through all subdirectories and process FITS files")
         print("from each 'light' or 'lights' directory found (any case).")
-        print("\nThe mount type is judged by solving frames spread across each directory's")
-        print("session and comparing how the field rotation changed with what an alt-az")
+        print("\nThe mount type is judged by solving frames from the largest session in each")
+        print("directory and comparing how the field rotation changed with what an alt-az")
         print("mount would produce at that site and time.")
         print("\nOptional environment variables:")
         print("  ASTROMETRY_NET_API_KEY   fallback solver key from https://nova.astrometry.net/api_help")
@@ -995,7 +1091,7 @@ def main():
 
     print("\nTelescope Mount Analysis")
     print("=" * 120)
-    print(f"Solves up to {MOUNT_SAMPLE_FRAMES} frames spread across each session (ASTAP, with one astrometry.net try at each end if ASTAP fails)")
+    print(f"Solves one frame at each end of each directory's largest session; up to {MOUNT_SAMPLE_FRAMES} frames only when that is ambiguous")
     print("Directories with no FITS files will be excluded from output")
 
     for lights_dir in sorted(lights_dirs):
