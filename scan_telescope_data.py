@@ -1,5 +1,6 @@
 from astropy.io import fits
-from astropy.coordinates import SkyCoord
+from astropy.coordinates import SkyCoord, Angle
+from astropy.time import Time
 from astropy.wcs import WCS
 import astropy.units as u
 import numpy as np
@@ -20,7 +21,20 @@ ASTAP_DATABASE = r"/usr/share/astap/data"
 # Set this in your environment instead of hardcoding it:
 #   export ASTROMETRY_NET_API_KEY="your key from nova.astrometry.net"
 ASTROMETRY_NET_API_KEY = os.environ.get("ASTROMETRY_NET_API_KEY", "")
-MAX_ASTAP_ATTEMPTS = 3  # Maximum number of files to try with ASTAP before switching to astrometry.net
+MAX_ASTAP_ATTEMPTS = 3  # Files to try with ASTAP at each end of the session before using astrometry.net
+
+# Mount detection settings
+MOUNT_TOLERANCE_DEG = 3.0         # How closely observed and expected rotation must agree
+MIN_PREDICTED_ROTATION_DEG = 6.0  # Alt-az rotation needed over the session to tell the mounts apart
+MIN_SPAN_NO_LOCATION_MIN = 30.0   # Minimum session length to judge without a site location
+
+# Used only when the FITS headers have no site location (east longitude positive):
+#   export SITE_LATITUDE=32.9 SITE_LONGITUDE=-96.7
+ENV_SITE_LATITUDE = os.environ.get("SITE_LATITUDE")
+ENV_SITE_LONGITUDE = os.environ.get("SITE_LONGITUDE")
+
+LAT_KEYS = ['SITELAT', 'LATITUDE', 'OBSLAT', 'LAT-OBS', 'LAT']
+LON_KEYS = ['SITELONG', 'LONGITUDE', 'OBSLONG', 'LONG-OBS', 'LON', 'LONG']
 
 
 def read_astap_ini(path):
@@ -52,22 +66,129 @@ def create_wcs_from_solution(ra_deg, dec_deg, rotation, header):
     return wcs
 
 
-def analyze_rotation_simple(rotation_angle):
-    """Simple analysis based on the rotation angle"""
-    print(f"    Field rotation: {rotation_angle:.1f}°")
+# ---------------------------------------------------------------------------
+# Mount type detection
+#
+# A single frame's rotation only says how the camera is oriented. What separates
+# the mount types is how that rotation changes during the session:
+#   equatorial: the field stays put (a meridian flip adds exactly 180 degrees)
+#   alt-az:     the field rotates by the change in parallactic angle
+# ---------------------------------------------------------------------------
 
-    # Check if close to 0° or 180° (equatorial) or something else (alt-az)
-    normalized_0 = min(rotation_angle % 360, 360 - (rotation_angle % 360))
-    normalized_180 = min(abs(rotation_angle - 180), 360 - abs(rotation_angle - 180))
+def wrap180(angle):
+    """Wrap an angle in degrees to the range [-180, 180)."""
+    return (angle + 180.0) % 360.0 - 180.0
 
-    deviation = min(normalized_0, normalized_180)
-    print(f"    Deviation from equatorial: {deviation:.1f}°")
 
-    if deviation < 10:  # Within 10° of 0° or 180°
-        return "EQUATORIAL"
-    else:
-        return "ALT-AZ"
+def to_float_deg(value):
+    """Parse a header latitude/longitude (number or sexagesimal string) to degrees, or None."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(Angle(str(value).strip(), unit=u.deg).deg)
+    except Exception:
+        return None
 
+
+def get_site_location(header):
+    """Return (latitude, longitude) in degrees from the header, falling back to the environment."""
+    lat = lon = None
+    for key in LAT_KEYS:
+        if key in header:
+            lat = to_float_deg(header[key])
+            if lat is not None:
+                break
+    for key in LON_KEYS:
+        if key in header:
+            lon = to_float_deg(header[key])
+            if lon is not None:
+                break
+    if lat is None or lon is None:
+        env_lat = to_float_deg(ENV_SITE_LATITUDE) if ENV_SITE_LATITUDE else None
+        env_lon = to_float_deg(ENV_SITE_LONGITUDE) if ENV_SITE_LONGITUDE else None
+        if env_lat is not None and env_lon is not None:
+            return env_lat, env_lon
+    if lat is None or lon is None:
+        return None, None
+    return lat, lon
+
+
+def get_frame_time(header):
+    """Return the UTC exposure start time from the header as an astropy Time, or None."""
+    for key in ('DATE-OBS', 'DATE_OBS'):
+        if key in header:
+            try:
+                return Time(str(header[key]).strip().rstrip('Zz'), scale='utc')
+            except Exception:
+                continue
+    return None
+
+
+def parallactic_angle_deg(ra_deg, dec_deg, lat_deg, lon_deg, obs_time):
+    """Parallactic angle in degrees for a sky position, site (east longitude positive) and UTC time."""
+    # Mean sidereal time from the Julian date. Accurate to well under a second, which is
+    # plenty here and avoids needing IERS data.
+    gmst_deg = 280.46061837 + 360.98564736629 * (obs_time.jd - 2451545.0)
+    lst_deg = (gmst_deg + lon_deg) % 360.0
+    hour_angle = np.radians(lst_deg - ra_deg)
+    lat = np.radians(lat_deg)
+    dec = np.radians(dec_deg)
+    q = np.arctan2(np.sin(hour_angle),
+                   np.tan(lat) * np.cos(dec) - np.sin(dec) * np.cos(hour_angle))
+    return float(np.degrees(q))
+
+
+def classify_mount(frame_a, frame_b):
+    """Decide the mount type from two solved frames.
+
+    Returns (mount_type, evidence) where mount_type is EQUATORIAL, ALT-AZ or INCONCLUSIVE.
+    """
+    delta = wrap180(frame_b['rotation'] - frame_a['rotation'])
+    # Distance of the observed change from 0 or 180 degrees (a meridian flip adds 180)
+    equatorial_residual = abs((delta + 90.0) % 180.0 - 90.0)
+
+    t_a, t_b = frame_a.get('time'), frame_b.get('time')
+    span_min = (t_b - t_a).to(u.min).value if (t_a is not None and t_b is not None) else None
+    span_text = f"{span_min / 60.0:.1f} h" if span_min is not None else "unknown span"
+
+    lat, lon = get_site_location(frame_a['header'])
+    predicted = None
+    if lat is not None and lon is not None and span_min is not None:
+        q_a = parallactic_angle_deg(frame_a['ra'], frame_a['dec'], lat, lon, t_a)
+        q_b = parallactic_angle_deg(frame_b['ra'], frame_b['dec'], lat, lon, t_b)
+        predicted = wrap180(q_b - q_a)
+
+    if predicted is not None:
+        # Compare against both signs, since the rotation sign convention varies by solver
+        altaz_residual = min(abs(wrap180(delta - predicted)), abs(wrap180(delta + predicted)))
+        evidence = (f"rotation changed {delta:+.1f} deg over {span_text}; "
+                    f"alt-az would change {predicted:+.1f} deg")
+
+        if abs(predicted) < MIN_PREDICTED_ROTATION_DEG:
+            return "INCONCLUSIVE", evidence + " (too little expected rotation to tell mounts apart)"
+        if equatorial_residual <= MOUNT_TOLERANCE_DEG and altaz_residual > MOUNT_TOLERANCE_DEG:
+            return "EQUATORIAL", evidence
+        if altaz_residual <= MOUNT_TOLERANCE_DEG and equatorial_residual > MOUNT_TOLERANCE_DEG:
+            return "ALT-AZ", evidence
+        return "INCONCLUSIVE", evidence + " (matches neither mount type)"
+
+    # No site location or times: judge from the observed change alone
+    evidence = (f"rotation changed {delta:+.1f} deg over {span_text}; "
+                f"no site location for an alt-az prediction")
+    if span_min is None or span_min < MIN_SPAN_NO_LOCATION_MIN:
+        return "INCONCLUSIVE", evidence + " (session too short to judge)"
+    if equatorial_residual <= MOUNT_TOLERANCE_DEG:
+        return "EQUATORIAL", evidence
+    if equatorial_residual > 3 * MOUNT_TOLERANCE_DEG:
+        return "ALT-AZ", evidence
+    return "INCONCLUSIVE", evidence
+
+
+# ---------------------------------------------------------------------------
+# Header and filename helpers
+# ---------------------------------------------------------------------------
 
 def get_position_from_header(header):
     """Extract RA/Dec from header for initial guess"""
@@ -142,12 +263,11 @@ def format_timestamp(timestamp_str):
 
 
 def extract_observatory_location(header):
-    """Extract observatory latitude and longitude from FITS header"""
+    """Extract observatory latitude and longitude from FITS header (as display strings)"""
     lat = 'Unknown'
     lon = 'Unknown'
 
-    lat_keys = ['SITELAT', 'LATITUDE', 'OBSLAT', 'LAT-OBS', 'LAT']
-    for key in lat_keys:
+    for key in LAT_KEYS:
         if key in header:
             try:
                 lat_val = header[key]
@@ -159,8 +279,7 @@ def extract_observatory_location(header):
             except Exception:
                 continue
 
-    lon_keys = ['SITELONG', 'LONGITUDE', 'OBSLONG', 'LONG-OBS', 'LON', 'LONG']
-    for key in lon_keys:
+    for key in LON_KEYS:
         if key in header:
             try:
                 lon_val = header[key]
@@ -221,6 +340,10 @@ def extract_header_info(header):
 
     return info
 
+
+# ---------------------------------------------------------------------------
+# Plate solvers
+# ---------------------------------------------------------------------------
 
 def run_astap_solve(filename, ra_hours=None, dec_degrees=None):
     """Run ASTAP and read the solution from the .ini file it writes.
@@ -422,68 +545,81 @@ def run_astrometry_net_solve(filename, ra_hours=None, dec_degrees=None):
         return None, None
 
 
-def process_file_with_astap(filename, ra_hours=None, dec_degrees=None):
-    """Process a file using only ASTAP (for the initial attempts)"""
-    print(f"\nProcessing with ASTAP: {os.path.basename(filename)}")
+def solve_frame(path, use_astrometry_net=False):
+    """Plate solve one frame. Returns a dict with solution, rotation, time and header, or None."""
+    print(f"\nProcessing: {os.path.basename(path)}")
     print("-" * 50)
 
     try:
-        with fits.open(filename) as hdul:
-            header = hdul[0].header
-
-            header_info = extract_header_info(header)
-
-            ra, dec = get_position_from_header(header)
-            if ra is not None:
-                print(f"  Initial position: RA={ra:.3f}h, DEC={dec:.3f}°")
-
-            solution, rotation = run_astap_solve(filename, ra, dec)
-
-            if solution is None:
-                print("  → ASTAP could not plate solve image")
-                return "UNKNOWN", header_info, "ASTAP"
-
-            print("  Analyzing field rotation...")
-            mount_type = analyze_rotation_simple(rotation)
-            print(f"  → Determined mount type: {mount_type}")
-            return mount_type, header_info, "ASTAP"
-
+        header = fits.getheader(path)
     except Exception as e:
-        print(f"  → Error processing file with ASTAP: {e}")
-        return "ERROR", {}, "ASTAP"
+        print(f"  → Could not read FITS header: {e}")
+        return None
+
+    ra, dec = get_position_from_header(header)
+    if ra is not None:
+        print(f"  Initial position: RA={ra:.3f}h, DEC={dec:.3f}°")
+
+    if use_astrometry_net:
+        wcs, rotation = run_astrometry_net_solve(path, ra, dec)
+        if wcs is None:
+            print("  → astrometry.net could not plate solve image")
+            return None
+        solved_ra, solved_dec = (float(v) for v in wcs.wcs.crval)
+        solver = "ASTROMETRY.NET"
+    else:
+        solution, rotation = run_astap_solve(path, ra, dec)
+        if solution is None:
+            print("  → ASTAP could not plate solve image")
+            return None
+        solved_ra, solved_dec = solution['ra'], solution['dec']
+        solver = "ASTAP"
+
+    return {
+        'file': path,
+        'solver': solver,
+        'ra': solved_ra,
+        'dec': solved_dec,
+        'rotation': float(rotation),
+        'time': get_frame_time(header),
+        'header': header,
+    }
 
 
-def process_file_with_astrometry(filename, ra_hours=None, dec_degrees=None):
-    """Process a file using astrometry.net (fallback)"""
-    print(f"\nProcessing with astrometry.net: {os.path.basename(filename)}")
-    print("-" * 50)
+def solve_end(candidates, label):
+    """Find one solvable frame from an ordered list of candidates.
 
-    try:
-        with fits.open(filename) as hdul:
-            header = hdul[0].header
+    Tries ASTAP on up to MAX_ASTAP_ATTEMPTS candidates, then astrometry.net on one.
+    Returns (frame_or_None, attempts_made).
+    """
+    attempts = 0
+    astap_candidates = candidates[:MAX_ASTAP_ATTEMPTS]
 
-            header_info = extract_header_info(header)
+    for path in astap_candidates:
+        attempts += 1
+        print(f"\n🔄 ASTAP attempt {attempts}/{len(astap_candidates)} on {label} frame: {os.path.basename(path)}")
+        frame = solve_frame(path)
+        if frame:
+            print(f"✅ Solved {label} frame with ASTAP")
+            return frame, attempts
+        print(f"❌ ASTAP failed on {os.path.basename(path)}")
 
-            ra, dec = get_position_from_header(header)
-            if ra is not None:
-                print(f"  Initial position: RA={ra:.3f}h, DEC={dec:.3f}°")
+    if candidates and ASTROMETRY_NET_API_KEY:
+        path = candidates[MAX_ASTAP_ATTEMPTS] if len(candidates) > MAX_ASTAP_ATTEMPTS else candidates[0]
+        attempts += 1
+        print(f"\n🔄 astrometry.net attempt on {label} frame: {os.path.basename(path)}")
+        frame = solve_frame(path, use_astrometry_net=True)
+        if frame:
+            print(f"✅ Solved {label} frame with astrometry.net")
+            return frame, attempts
+        print("❌ astrometry.net also failed")
 
-            print("  Calling astrometry.net solver...")
-            wcs, rotation = run_astrometry_net_solve(filename, ra, dec)
+    return None, attempts
 
-            if wcs is None:
-                print("  → Astrometry.net could not plate solve image")
-                return "UNKNOWN", header_info, "ASTROMETRY.NET"
 
-            print("  Analyzing field rotation...")
-            mount_type = analyze_rotation_simple(rotation)
-            print(f"  → Determined mount type: {mount_type}")
-            return mount_type, header_info, "ASTROMETRY.NET"
-
-    except Exception as e:
-        print(f"  → Error processing file with astrometry.net: {e}")
-        return "ERROR", {}, "ASTROMETRY.NET"
-
+# ---------------------------------------------------------------------------
+# Directory handling
+# ---------------------------------------------------------------------------
 
 def find_lights_directories(root_path):
     """Find all directories named 'light' or 'lights', in any case, under root_path."""
@@ -501,8 +637,24 @@ def find_all_fits_files(directory):
     return sorted(fits_files) if fits_files else []
 
 
+def sort_files_by_time(files):
+    """Order files by DATE-OBS, falling back to file name for files without a readable time."""
+    keyed = []
+    for path in files:
+        jd = float('inf')
+        try:
+            t = get_frame_time(fits.getheader(path))
+            if t is not None:
+                jd = t.jd
+        except Exception:
+            pass
+        keyed.append((jd, path))
+    keyed.sort(key=lambda item: (item[0], item[1]))
+    return [path for _, path in keyed]
+
+
 def process_directory(lights_dir):
-    """Process a directory by trying up to MAX_ASTAP_ATTEMPTS with ASTAP, then ONE file with astrometry.net"""
+    """Solve the first and last usable frames in a directory and classify the mount from the rotation change"""
     print(f"\n📁 Processing directory: {lights_dir}")
 
     fits_files = find_all_fits_files(lights_dir)
@@ -518,64 +670,57 @@ def process_directory(lights_dir):
     for exp, count in sorted(exposure_counts.items()):
         print(f"      {exp}: {count} frames")
 
+    ordered = sort_files_by_time(fits_files)
+
     mount_type = "UNKNOWN"
+    mount_evidence = "No frame could be plate solved"
     header_info = {}
-    successful_file = None
+    solved_frames = []
     attempts = 0
-    solver_used = "NONE"
 
-    # Phase 1: Try ASTAP on first MAX_ASTAP_ATTEMPTS files
-    astap_files = fits_files[:MAX_ASTAP_ATTEMPTS]
-    print(f"\n🔧 Phase 1: Trying ASTAP on first {len(astap_files)} files")
+    # Solve near the start of the session
+    print("\n🔧 Solving a frame from the start of the session")
+    frame_a, n = solve_end(ordered, "first")
+    attempts += n
 
-    for fits_file in astap_files:
-        attempts += 1
-        print(f"\n🔄 ASTAP Attempt {attempts}/{len(astap_files)}: {os.path.basename(fits_file)}")
+    # Solve near the end of the session, skipping the frame already solved
+    frame_b = None
+    if frame_a is not None:
+        solved_frames.append(frame_a)
+        later = [p for p in reversed(ordered) if p != frame_a['file']]
+        if later:
+            print("\n🔧 Solving a frame from the end of the session")
+            frame_b, n = solve_end(later, "last")
+            attempts += n
+        if frame_b is not None:
+            solved_frames.append(frame_b)
 
-        current_mount_type, current_header_info, current_solver = process_file_with_astap(fits_file)
+    if frame_a is not None and frame_b is not None:
+        mount_type, mount_evidence = classify_mount(frame_a, frame_b)
+        print(f"\n  → Determined mount type: {mount_type}")
+        print(f"    {mount_evidence}")
+    elif frame_a is not None:
+        mount_type = "INCONCLUSIVE"
+        mount_evidence = "Only one frame could be solved, so rotation change is unknown"
+        print(f"\n  → {mount_evidence}")
+    else:
+        print("\n❌ Could not plate solve any files in this directory")
 
-        if current_mount_type not in ["UNKNOWN", "ERROR"]:
-            mount_type = current_mount_type
-            header_info = current_header_info
-            successful_file = fits_file
-            solver_used = current_solver
-            print(f"✅ Successfully processed {os.path.basename(fits_file)} with ASTAP on attempt {attempts}")
-            break
-        else:
-            print(f"❌ ASTAP failed on {os.path.basename(fits_file)}")
+    # Header info from the first solved frame, else from the first file
+    if frame_a is not None:
+        header_info = extract_header_info(frame_a['header'])
+    else:
+        try:
+            header_info = extract_header_info(fits.getheader(ordered[0]))
+        except Exception:
+            header_info = {}
 
-    # Phase 2: If ASTAP failed, try ONLY ONE file with astrometry.net
-    if mount_type in ["UNKNOWN", "ERROR"]:
-        print("\n🔧 Phase 2: ASTAP failed, trying ONE file with astrometry.net")
-
-        if len(fits_files) > MAX_ASTAP_ATTEMPTS:
-            fits_file = fits_files[MAX_ASTAP_ATTEMPTS]
-        else:
-            fits_file = fits_files[0]
-
-        print(f"\n🔄 Astrometry.net Attempt (1/1): {os.path.basename(fits_file)}")
-
-        current_mount_type, current_header_info, current_solver = process_file_with_astrometry(fits_file)
-
-        if current_mount_type not in ["UNKNOWN", "ERROR"]:
-            mount_type = current_mount_type
-            header_info = current_header_info
-            successful_file = fits_file
-            solver_used = current_solver
-            print("✅ Successfully processed with astrometry.net")
-        else:
-            print("❌ Astrometry.net also failed")
-            attempts += 1
-
-    if mount_type in ["UNKNOWN", "ERROR"]:
-        print("❌ Could not plate solve any files in this directory")
-        if fits_files:
-            with fits.open(fits_files[0]) as hdul:
-                header_info = extract_header_info(hdul[0].header)
+    solvers = sorted({f['solver'] for f in solved_frames})
 
     return {
         'directory': lights_dir,
         'mount_type': mount_type,
+        'mount_evidence': mount_evidence,
         'total_files': total_files,
         'exposure_counts': exposure_counts,
         'target': header_info.get('target', 'Unknown'),
@@ -584,12 +729,16 @@ def process_directory(lights_dir):
         'instrument': header_info.get('instrument', 'Unknown'),
         'latitude': header_info.get('latitude', 'Unknown'),
         'longitude': header_info.get('longitude', 'Unknown'),
-        'solved_file': successful_file,
-        'solver_used': solver_used,
+        'solved_files': [os.path.basename(f['file']) for f in solved_frames],
+        'solver_used': '+'.join(solvers) if solvers else 'NONE',
         'attempts_made': attempts,
         'total_attempts': len(fits_files)
     }
 
+
+# ---------------------------------------------------------------------------
+# Object name handling
+# ---------------------------------------------------------------------------
 
 def normalize_object_name(object_name):
     """
@@ -771,9 +920,11 @@ def main():
         print("Example: python scan_telescope_data.py /home/brian/nina")
         print("This will walk through all subdirectories and process FITS files")
         print("from each 'light' or 'lights' directory found (any case).")
-        print("\nNote: astrometry.net fallback needs an API key in the")
-        print("ASTROMETRY_NET_API_KEY environment variable.")
-        print("Get one from: https://nova.astrometry.net/api_help")
+        print("\nThe mount type is judged by solving the first and last frame of each")
+        print("directory and comparing how the field rotation changed between them.")
+        print("\nOptional environment variables:")
+        print("  ASTROMETRY_NET_API_KEY   fallback solver key from https://nova.astrometry.net/api_help")
+        print("  SITE_LATITUDE / SITE_LONGITUDE   site location (east positive) when headers lack it")
         return
 
     root_path = sys.argv[1]
@@ -794,7 +945,7 @@ def main():
 
     print("\nTelescope Mount Analysis")
     print("=" * 120)
-    print(f"Will try up to {MAX_ASTAP_ATTEMPTS} files with ASTAP first, then ONE file with astrometry.net")
+    print(f"Solves a frame at each end of every session (up to {MAX_ASTAP_ATTEMPTS} ASTAP tries per end, then one astrometry.net try)")
     print("Directories with no FITS files will be excluded from output")
 
     for lights_dir in sorted(lights_dirs):
@@ -849,6 +1000,7 @@ def main():
             'Is Mosaic': mosaic_display,
             'Mosaic Details': mosaic_detail,
             'Mount Type': mount_type,
+            'Mount Evidence': result.get('mount_evidence', ''),
             'Filter': filter_val,
             'Date': date,
             'Directory': directory,
@@ -856,7 +1008,7 @@ def main():
             'Longitude': longitude,
             'Total Files': result['total_files'],
             'Instrument': result.get('instrument', 'Unknown'),
-            'Solved File': os.path.basename(result.get('solved_file', '')) if result.get('solved_file') else 'None',
+            'Solved File': ' | '.join(result['solved_files']) if result.get('solved_files') else 'None',
             'Solver Used': result.get('solver_used', 'NONE'),
             'Attempts': f"{result.get('attempts_made', 0)}/{result.get('total_attempts', 0)}"
         }
@@ -900,7 +1052,7 @@ def main():
     if mosaic_objects > 0:
         print(f"\n🧩 Found {mosaic_objects} objects with mosaic panels")
 
-    header = f"{'Target':<25} {'Normalized':<15} {'Catalog':<10} {'Mosaic':<6} {'Mount':<12} {'Filter':<8} {'Date':<15} {'Solver':<12} {'Directory'}"
+    header = f"{'Target':<25} {'Normalized':<15} {'Catalog':<10} {'Mosaic':<6} {'Mount':<13} {'Filter':<8} {'Date':<15} {'Solver':<12} {'Directory'}"
     print(f"\n{'=' * 120}")
     print("DETAILED RESULTS")
     print("=" * 120)
@@ -909,15 +1061,15 @@ def main():
 
     for row in all_rows:
         mosaic_indicator = "🧩" if row['Is Mosaic'] == "Yes" else "  "
-        print(f"{row['Target']:<25} {row['Normalized Name']:<15} {row['Catalog Type']:<10} {mosaic_indicator:<6} {row['Mount Type']:<12} {row['Filter']:<8} {row['Date']:<15} {row['Solver Used']:<12} {row['Directory']}")
+        print(f"{row['Target']:<25} {row['Normalized Name']:<15} {row['Catalog Type']:<10} {mosaic_indicator:<6} {row['Mount Type']:<13} {row['Filter']:<8} {row['Date']:<15} {row['Solver Used']:<12} {row['Directory']}")
 
     csv_filename = "telescope_analysis.csv"
     try:
         with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = ['Target', 'Normalized Name', 'Catalog Type', 'Is Mosaic', 'Mosaic Details',
-                          'Mount Type', 'Filter', 'Date', 'Exposure', 'Frames', 'Directory',
-                          'Latitude', 'Longitude', 'Total Files', 'Instrument', 'Solved File',
-                          'Solver Used', 'Attempts']
+                          'Mount Type', 'Mount Evidence', 'Filter', 'Date', 'Exposure', 'Frames',
+                          'Directory', 'Latitude', 'Longitude', 'Total Files', 'Instrument',
+                          'Solved File', 'Solver Used', 'Attempts']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
             writer.writeheader()
@@ -927,15 +1079,18 @@ def main():
         print(f"\n✅ Results saved to: {csv_filename}")
         print(f"📊 Total records: {len(all_rows)}")
 
-        successful_solves = sum(1 for r in results if r['mount_type'] not in ["UNKNOWN", "ERROR"])
         total_dirs_with_files = len(results)
-        astap_solves = sum(1 for r in results if r.get('solver_used') == 'ASTAP')
-        astrometry_solves = sum(1 for r in results if r.get('solver_used') == 'ASTROMETRY.NET')
+        classified = sum(1 for r in results if r['mount_type'] in ("EQUATORIAL", "ALT-AZ"))
+        inconclusive = sum(1 for r in results if r['mount_type'] == "INCONCLUSIVE")
+        unsolved = sum(1 for r in results if r['mount_type'] in ("UNKNOWN", "ERROR"))
+        astap_dirs = sum(1 for r in results if 'ASTAP' in r.get('solver_used', ''))
+        astrometry_dirs = sum(1 for r in results if 'ASTROMETRY.NET' in r.get('solver_used', ''))
 
         mosaic_dirs = sum(1 for r in results if r.get('is_mosaic', False))
 
-        print(f"📈 Success rate: {successful_solves}/{total_dirs_with_files} directories successfully plate solved")
-        print(f"🔧 Solvers: {astap_solves} ASTAP, {astrometry_solves} astrometry.net")
+        print(f"📈 Mount classified: {classified}/{total_dirs_with_files} directories "
+              f"({inconclusive} inconclusive, {unsolved} could not be plate solved)")
+        print(f"🔧 Solvers used: {astap_dirs} directories with ASTAP, {astrometry_dirs} with astrometry.net")
         print(f"🧩 Mosaic directories: {mosaic_dirs}/{total_dirs_with_files}")
 
         total_lights_dirs_found = len(lights_dirs)
