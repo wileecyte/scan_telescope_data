@@ -285,6 +285,14 @@ def extract_exposure_from_filename(filename):
     return "Unknown"
 
 
+def exposure_seconds(exposure_label):
+    """Seconds from a label like '20.0s', or None when the exposure is unknown."""
+    try:
+        return float(str(exposure_label).rstrip('s'))
+    except ValueError:
+        return None
+
+
 def analyze_exposure_distribution(directory):
     """Analyze exposure times from all FITS filenames in directory"""
     fits_files = glob.glob(os.path.join(directory, '*.fit')) + glob.glob(os.path.join(directory, '*.fits'))
@@ -674,13 +682,23 @@ def solve_end(candidates, label):
 # Directory handling
 # ---------------------------------------------------------------------------
 
+def report_walk_error(error):
+    """os.walk skips directories it cannot read without a word, which hides a stalled or stale mount."""
+    print(f"⚠️  Could not read {error.filename}: {error.strerror}")
+
+
 def find_lights_directories(root_path):
-    """Find all directories named 'light' or 'lights', in any case, under root_path."""
+    """Find all directories named 'light' or 'lights', in any case, under root_path.
+
+    Does not descend into the light folders themselves, which on a network share saves
+    listing every large folder twice.
+    """
     lights_dirs = []
-    for root, dirs, _files in os.walk(root_path):
+    for root, dirs, _files in os.walk(root_path, onerror=report_walk_error):
         for d in dirs:
             if d.lower() in ("light", "lights"):
                 lights_dirs.append(os.path.join(root, d))
+        dirs[:] = [d for d in dirs if d.lower() not in ("light", "lights")]
     return lights_dirs
 
 
@@ -1109,6 +1127,8 @@ def group_similar_objects(results):
                 'directories': [],
                 'mount_types': set(),
                 'total_files': 0,
+                'integration_s': 0.0,
+                'filter_seconds': {},
                 'mosaic_panels': set(),
                 'has_mosaic': False,
                 'mosaic_catalog_type': catalog_type
@@ -1120,6 +1140,12 @@ def group_similar_objects(results):
             group['directories'].append(result['directory'])
         group['mount_types'].add(result['mount_type'])
         group['total_files'] += result['total_files']
+        # Every frame counts, including Seestar frames flagged "failed", which can still be stacked elsewhere
+        for (filter_name, exp), count in result.get('filter_exposure_counts', {}).items():
+            secs = exposure_seconds(exp)
+            if secs is not None:
+                group['integration_s'] += count * secs
+                group['filter_seconds'][filter_name] = group['filter_seconds'].get(filter_name, 0.0) + count * secs
 
         if mosaic_info and mosaic_info['is_mosaic']:
             group['has_mosaic'] = True
@@ -1134,10 +1160,26 @@ def group_similar_objects(results):
     return object_groups
 
 
+def parse_args(argv):
+    """Return (root paths, CSV file name) from the command line arguments."""
+    roots = []
+    csv_name = "telescope_analysis.csv"
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("-o", "--output") and i + 1 < len(argv):
+            csv_name = argv[i + 1]
+            i += 2
+        else:
+            roots.append(argv[i])
+            i += 1
+    return roots, csv_name
+
+
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python scan_telescope_data.py <directory_path>")
-        print("Example: python scan_telescope_data.py /home/brian/nina")
+    roots, csv_filename = parse_args(sys.argv[1:])
+    if not roots:
+        print("Usage: python scan_telescope_data.py [-o output.csv] <directory_path> [<directory_path> ...]")
+        print("Example: python scan_telescope_data.py /home/brian/nina /mnt/nas/astro")
         print("This will walk through all subdirectories and process FITS files")
         print("from each 'light' or 'lights' directory found (any case).")
         print("\nThe mount type is judged separately for each observing session (a gap of")
@@ -1149,14 +1191,18 @@ def main():
         print("  SITE_LATITUDE / SITE_LONGITUDE   site location (east positive) when headers lack it")
         return
 
-    root_path = sys.argv[1]
-
-    if not os.path.exists(root_path):
-        print(f"Error: Directory not found: {root_path}")
-        return
-
     print("Searching for 'light'/'lights' directories...")
-    lights_dirs = find_lights_directories(root_path)
+    lights_dirs = []
+    seen = set()
+    for root_path in roots:
+        if not os.path.exists(root_path):
+            print(f"Error: Directory not found: {root_path} (is the share mounted?)")
+            continue
+        for found in find_lights_directories(root_path):
+            key = os.path.realpath(found)
+            if key not in seen:
+                seen.add(key)
+                lights_dirs.append(found)
 
     if not lights_dirs:
         print("No 'light' or 'lights' directories found!")
@@ -1238,11 +1284,14 @@ def main():
                 row['Filter'] = filter_name
                 row['Exposure'] = exp
                 row['Frames'] = count
+                secs = exposure_seconds(exp)
+                row['Integration (h)'] = f"{count * secs / 3600:.2f}" if secs is not None else ''
                 all_rows.append(row)
         else:
             row = dict(base_row)
             row['Filter'] = 'Unknown'
             row['Exposure'] = 'No data'
+            row['Integration (h)'] = ''
             row['Frames'] = result['total_files']
             all_rows.append(row)
 
@@ -1264,6 +1313,9 @@ def main():
         print(f"    Original names: {', '.join(sorted(group['original_names']))}")
         print(f"    Directories: {len(group['directories'])}")
         print(f"    Total files: {group['total_files']}")
+        if group['integration_s'] > 0:
+            by_filter = ", ".join(f"{name} {secs / 3600:.1f} h" for name, secs in sorted(group['filter_seconds'].items()))
+            print(f"    Integration: {group['integration_s'] / 3600:.1f} h ({by_filter})")
         print(f"    Mount types: {', '.join(sorted(group['mount_types']))}")
         if group['has_mosaic']:
             mosaic_objects += 1
@@ -1284,11 +1336,10 @@ def main():
         mosaic_indicator = "🧩" if row['Is Mosaic'] == "Yes" else "  "
         print(f"{row['Target']:<25} {row['Normalized Name']:<15} {row['Catalog Type']:<10} {mosaic_indicator:<6} {row['Mount Type']:<13} {row['Filter']:<16} {row['Date']:<15} {row['Solver Used']:<12} {row['Directory']}")
 
-    csv_filename = "telescope_analysis.csv"
     try:
         with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = ['Target', 'Normalized Name', 'Catalog Type', 'Is Mosaic', 'Mosaic Details',
-                          'Mount Type', 'Mount Evidence', 'Filter', 'Session', 'Date', 'Exposure', 'Frames',
+                          'Mount Type', 'Mount Evidence', 'Filter', 'Session', 'Date', 'Exposure', 'Frames', 'Integration (h)',
                           'Directory', 'Latitude', 'Longitude', 'Total Files', 'Instrument',
                           'Solved File', 'Solver Used', 'Attempts']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
