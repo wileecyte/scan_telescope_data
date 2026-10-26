@@ -25,6 +25,7 @@ ASTROMETRY_NET_API_KEY = os.environ.get("ASTROMETRY_NET_API_KEY", "")
 MAX_ASTAP_ATTEMPTS = 3  # Files to try with ASTAP at each end of the session before using astrometry.net
 ASTAP_TIMEOUT_SEC = 60  # A solve that takes longer than this is abandoned
 SESSION_GAP_HOURS = 6.0  # A gap this long between frames starts a new observing session
+NIGHT_GAP_HOURS = 3.0  # Sessions this close together on the same instrument count as one night
 
 # Mount detection settings
 MOUNT_SAMPLE_FRAMES = 5           # Total frames solved when the two ends are ambiguous
@@ -224,7 +225,13 @@ def classify_mount(frames):
         # More frames only help when both hypotheses fit the ends (for example an alt-az
         # rotation near 180 degrees that looks like a meridian flip)
         both_fit = equatorial_miss <= FIT_TOLERANCE_DEG and altaz_miss <= FIT_TOLERANCE_DEG
-        return "INCONCLUSIVE", evidence + " (cannot separate the two mount types)", both_fit and more_frames_help
+        neither_fit = equatorial_miss > FIT_TOLERANCE_DEG and altaz_miss > FIT_TOLERANCE_DEG
+        # When neither fits, frames in between show how the rotation develops during the session
+        more = (both_fit and more_frames_help) or (neither_fit and len(frames) < MOUNT_SAMPLE_FRAMES)
+        if len(frames) >= 3:
+            evidence += (f"; per frame observed {[round(d, 1) for d in observed]} "
+                         f"vs alt-az {[round(x, 1) for x in predicted]}")
+        return "INCONCLUSIVE", evidence + " (cannot separate the two mount types)", more
 
     # No site location or times: judge from the observed change alone
     evidence = (f"{len(frames)} frames over {span_text}; worst deviation from a fixed field "
@@ -405,12 +412,24 @@ def extract_header_info(header):
 # Plate solvers
 # ---------------------------------------------------------------------------
 
-def run_astap_solve(filename, ra_hours=None, dec_degrees=None):
+def astap_log_tail(base, lines=3):
+    """Last few lines of the log ASTAP wrote, which usually say why a solve failed."""
+    try:
+        with open(base + ".log", errors="replace") as f:
+            return [line.strip() for line in f.readlines() if line.strip()][-lines:]
+    except OSError:
+        return []
+
+
+def run_astap_solve(filename, ra_hours=None, dec_degrees=None, thorough=False):
     """Run ASTAP and read the solution from the .ini file it writes.
 
     The Linux GUI build prints the solution line in a different format than the
     Windows console build, so the key=value .ini file is used instead of stdout.
     Output goes to a temp directory so image folders stay clean.
+
+    With thorough=True a failed solve is retried without downsampling (-z 1), which keeps
+    more stars in sparse frames such as narrowband nebula fields.
     """
     print("  Running ASTAP plate solver...")
 
@@ -418,38 +437,44 @@ def run_astap_solve(filename, ra_hours=None, dec_degrees=None):
         print(f"    ERROR: ASTAP not found at {ASTAP_PATH}")
         return None, None
 
+    downsample_options = ['2', '1'] if thorough else ['2']
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            base = os.path.join(tmp, "solve")
-            cmd = [ASTAP_PATH, '-f', filename, '-r', '10', '-z', '2', '-fov', '0',
-                   '-wcs', '-log', '-o', base]
+            for step, downsample in enumerate(downsample_options):
+                base = os.path.join(tmp, f"solve{step}")
+                cmd = [ASTAP_PATH, '-f', filename, '-r', '10', '-z', downsample, '-fov', '0',
+                       '-wcs', '-log', '-o', base]
 
-            if os.path.exists(ASTAP_DATABASE):
-                cmd.extend(['-d', ASTAP_DATABASE])
+                if os.path.exists(ASTAP_DATABASE):
+                    cmd.extend(['-d', ASTAP_DATABASE])
 
-            if ra_hours is not None and dec_degrees is not None:
-                cmd.extend(['-ra', f"{ra_hours:.6f}", '-spd', f"{dec_degrees + 90:.6f}"])
+                if ra_hours is not None and dec_degrees is not None:
+                    cmd.extend(['-ra', f"{ra_hours:.6f}", '-spd', f"{dec_degrees + 90:.6f}"])
 
-            print(f"    Command: {' '.join(cmd)}")
-            started = time.time()
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=ASTAP_TIMEOUT_SEC)
-            print(f"    Return code: {result.returncode} ({time.time() - started:.1f} s)")
+                print(f"    Command: {' '.join(cmd)}")
+                started = time.time()
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=ASTAP_TIMEOUT_SEC)
+                print(f"    Return code: {result.returncode} ({time.time() - started:.1f} s)")
 
-            ini_path = base + ".ini"
-            if not os.path.exists(ini_path):
-                print("    ✗ ASTAP wrote no .ini file")
-                return None, None
+                ini_path = base + ".ini"
+                if not os.path.exists(ini_path):
+                    print("    ✗ ASTAP wrote no .ini file")
+                    for line in astap_log_tail(base):
+                        print(f"      log: {line}")
+                    continue
 
-            ini = read_astap_ini(ini_path)
-            if ini.get('PLTSOLVD', 'F').upper() != 'T':
-                print(f"    ✗ Not solved. {ini.get('ERROR', '')}")
-                return None, None
+                ini = read_astap_ini(ini_path)
+                if ini.get('PLTSOLVD', 'F').upper() != 'T':
+                    print(f"    ✗ Not solved (-z {downsample}). {ini.get('ERROR', '')}")
+                    for line in astap_log_tail(base):
+                        print(f"      log: {line}")
+                    continue
 
-            ra = float(ini['CRVAL1'])
-            dec = float(ini['CRVAL2'])
-            rotation = float(ini['CROTA2'])
-            print(f"    ✓ Solved: RA={ra:.4f}°, DEC={dec:.4f}°, rotation={rotation:.1f}°")
-            return {'ra': ra, 'dec': dec, 'rotation': rotation}, rotation
+                ra = float(ini['CRVAL1'])
+                dec = float(ini['CRVAL2'])
+                rotation = float(ini['CROTA2'])
+                print(f"    ✓ Solved: RA={ra:.4f}°, DEC={dec:.4f}°, rotation={rotation:.1f}°")
+                return {'ra': ra, 'dec': dec, 'rotation': rotation}, rotation
 
     except subprocess.TimeoutExpired:
         print(f"    ✗ ASTAP timed out after {ASTAP_TIMEOUT_SEC} s")
@@ -606,7 +631,7 @@ def run_astrometry_net_solve(filename, ra_hours=None, dec_degrees=None):
         return None, None
 
 
-def solve_frame(path, use_astrometry_net=False):
+def solve_frame(path, use_astrometry_net=False, thorough=False):
     """Plate solve one frame. Returns a dict with solution, rotation, time and header, or None."""
     print(f"\nProcessing: {os.path.basename(path)}")
     print("-" * 50)
@@ -629,7 +654,7 @@ def solve_frame(path, use_astrometry_net=False):
         solved_ra, solved_dec = (float(v) for v in wcs.wcs.crval)
         solver = "ASTROMETRY.NET"
     else:
-        solution, rotation = run_astap_solve(path, ra, dec)
+        solution, rotation = run_astap_solve(path, ra, dec, thorough=thorough)
         if solution is None:
             print("  → ASTAP could not plate solve image")
             return None
@@ -659,7 +684,7 @@ def solve_end(candidates, label):
     for path in astap_candidates:
         attempts += 1
         print(f"\n🔄 ASTAP attempt {attempts}/{len(astap_candidates)} on {label} frame: {os.path.basename(path)}")
-        frame = solve_frame(path)
+        frame = solve_frame(path, thorough=(attempts == 1))
         if frame:
             print(f"✅ Solved {label} frame with ASTAP")
             return frame, attempts
@@ -839,6 +864,33 @@ def assign_filters(paths):
     return result
 
 
+def combine_with_header(mount_type, evidence, headers):
+    """Cross-check the rotation verdict against the mount mode newer Seestar firmware records (EQMODE).
+
+    Rotation is measured, so it wins when decisive, and a disagreement is flagged as CONFLICT.
+    When rotation cannot decide, the header value is used. Returns (mount_type, evidence, eqmode text).
+    """
+    values = {h['EQMODE'] for h in headers if h is not None and 'EQMODE' in h}
+    if not values:
+        return mount_type, evidence, ''
+    shown = '/'.join(sorted(str(v) for v in values))
+    modes = set()
+    for value in values:
+        try:
+            modes.add("EQUATORIAL" if int(value) == 1 else "ALT-AZ")
+        except (TypeError, ValueError):
+            pass
+    if len(modes) != 1:
+        return mount_type, evidence + f" (header EQMODE unclear: {shown})", shown
+    header_mode = modes.pop()
+    if mount_type in ("EQUATORIAL", "ALT-AZ"):
+        if mount_type == header_mode:
+            return mount_type, evidence + f" (header EQMODE={shown} agrees)", shown
+        return ("CONFLICT",
+                evidence + f" (rotation says {mount_type} but header EQMODE={shown} says {header_mode})", shown)
+    return header_mode, f"mount mode from header EQMODE={shown}; rotation: {evidence}", shown
+
+
 def process_session(lights_dir, session, index, total):
     """Solve frames from one observing session and classify the mount.
 
@@ -917,6 +969,18 @@ def process_session(lights_dir, session, index, total):
     else:
         print("\n❌ Could not plate solve any files in this session")
 
+    # Cross-check against the mount mode recorded in the headers, when the firmware writes one
+    if frames:
+        headers = [f['header'] for f in frames]
+    else:
+        try:
+            headers = [fits.getheader(ordered[0])]
+        except Exception:
+            headers = []
+    mount_type, mount_evidence, eqmode_value = combine_with_header(mount_type, mount_evidence, headers)
+    if eqmode_value != '':
+        print(f"  → Header EQMODE={eqmode_value}; mount type: {mount_type}")
+
     # Header info from the earliest solved frame, else from the first file
     if frames:
         header_info = extract_header_info(frames[0]['header'])
@@ -937,6 +1001,8 @@ def process_session(lights_dir, session, index, total):
         'session': f"{index}/{total}",
         'mount_type': mount_type,
         'mount_evidence': mount_evidence,
+        'eqmode': eqmode_value,
+        'frames': frames,
         'total_files': len(session),
         'filter_exposure_counts': filter_exposure_counts,
         'target': header_info.get('target', 'Unknown'),
@@ -949,6 +1015,55 @@ def process_session(lights_dir, session, index, total):
         'attempts_made': attempts,
         'total_attempts': len(session)
     }
+
+
+def pool_inconclusive(results):
+    """Re-judge inconclusive sessions together with the other sessions from the same night.
+
+    One mosaic panel or a short run barely rotates under alt-az, so it cannot separate the
+    mount types alone. The sessions of a night span hours, and the alt-az prediction already
+    uses each frame's own pointing and time, so their frames can be classified as one set.
+    A pooled verdict is applied only when no session in the group was classified differently.
+    Returns the number of sessions that were resolved.
+    """
+    usable = [r for r in results
+              if r.get('frames') and r['frames'][0].get('time') is not None and r['frames'][-1].get('time') is not None]
+    usable.sort(key=lambda r: frame_sort_key(r['frames'][0]))
+
+    groups = []
+    current, current_end, current_instrument = [], None, None
+    for r in usable:
+        start, end = r['frames'][0]['time'], r['frames'][-1]['time']
+        if current and r.get('instrument') == current_instrument \
+                and (start - current_end).to(u.hour).value <= NIGHT_GAP_HOURS:
+            current.append(r)
+            current_end = max(current_end, end)
+        else:
+            if current:
+                groups.append(current)
+            current, current_end, current_instrument = [r], end, r.get('instrument')
+    if current:
+        groups.append(current)
+
+    resolved = 0
+    for group in groups:
+        pending = [r for r in group if r['mount_type'] == "INCONCLUSIVE"]
+        if not pending or len(group) < 2:
+            continue
+        frames = sorted((f for r in group for f in r['frames']), key=frame_sort_key)
+        if len({f['solver'] for f in frames}) > 1:
+            continue
+        verdict, evidence, _ = classify_mount(frames)
+        if verdict not in ("EQUATORIAL", "ALT-AZ"):
+            continue
+        decided = {r['mount_type'] for r in group if r['mount_type'] in ("EQUATORIAL", "ALT-AZ")}
+        if decided - {verdict}:
+            continue  # a session from the same night was classified differently
+        for r in pending:
+            r['mount_type'] = verdict
+            r['mount_evidence'] = f"pooled with {len(group) - 1} other session(s) from the same night: {evidence}"
+        resolved += len(pending)
+    return resolved
 
 
 def process_directory(lights_dir):
@@ -1223,6 +1338,10 @@ def main():
         print("\n❌ No directories with FITS files found!")
         return
 
+    pooled = pool_inconclusive(results)
+    if pooled:
+        print(f"\n🔗 Classified {pooled} short sessions by pooling them with other sessions from the same night")
+
     object_groups = group_similar_objects(results)
 
     all_rows = []
@@ -1266,6 +1385,7 @@ def main():
             'Mosaic Details': mosaic_detail,
             'Mount Type': mount_type,
             'Mount Evidence': result.get('mount_evidence', ''),
+            'EQMODE': result.get('eqmode', ''),
             'Session': result.get('session', '1/1'),
             'Date': date,
             'Directory': directory,
@@ -1339,7 +1459,7 @@ def main():
     try:
         with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = ['Target', 'Normalized Name', 'Catalog Type', 'Is Mosaic', 'Mosaic Details',
-                          'Mount Type', 'Mount Evidence', 'Filter', 'Session', 'Date', 'Exposure', 'Frames', 'Integration (h)',
+                          'Mount Type', 'Mount Evidence', 'EQMODE', 'Filter', 'Session', 'Date', 'Exposure', 'Frames', 'Integration (h)',
                           'Directory', 'Latitude', 'Longitude', 'Total Files', 'Instrument',
                           'Solved File', 'Solver Used', 'Attempts']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -1354,6 +1474,7 @@ def main():
         total_dirs_with_files = len(results)
         classified = sum(1 for r in results if r['mount_type'] in ("EQUATORIAL", "ALT-AZ"))
         inconclusive = sum(1 for r in results if r['mount_type'] == "INCONCLUSIVE")
+        conflicts = sum(1 for r in results if r['mount_type'] == "CONFLICT")
         unsolved = sum(1 for r in results if r['mount_type'] in ("UNKNOWN", "ERROR"))
         astap_dirs = sum(1 for r in results if 'ASTAP' in r.get('solver_used', ''))
         astrometry_dirs = sum(1 for r in results if 'ASTROMETRY.NET' in r.get('solver_used', ''))
@@ -1361,7 +1482,7 @@ def main():
         mosaic_dirs = sum(1 for r in results if r.get('is_mosaic', False))
 
         print(f"📈 Mount classified: {classified}/{total_dirs_with_files} sessions "
-              f"({inconclusive} inconclusive, {unsolved} could not be plate solved)")
+              f"({inconclusive} inconclusive, {conflicts} conflicting with the header, {unsolved} could not be plate solved)")
         print(f"🔧 Solvers used: {astap_dirs} sessions with ASTAP, {astrometry_dirs} with astrometry.net")
         print(f"🧩 Mosaic sessions: {mosaic_dirs}/{total_dirs_with_files}")
 
