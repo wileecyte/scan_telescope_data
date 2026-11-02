@@ -32,6 +32,12 @@ SASP_TIMEOUT_SEC = 180
 SASP_MAX_ATTEMPTS = 4  # frames tried per end with SASPro blind (1664 blind solves in the archive run: 1650 on try 1, 14 later)
 SASP_SEEDED_ATTEMPTS = 1  # frames tried per end with SASPro seeded (all 18 archive seeded solves came on try 1)
 ASTROMETRY_ONLY = False  # --astrometry-only: skip ASTAP (for frames with too few stars, e.g. narrowband filters)
+# Telescope name to report when a frame's header has no TELESCOP value (NINA leaves it empty unless
+# the equipment profile names the telescope). Keys are matched against the Instrument value,
+# ignoring case. A TELESCOP value in the header always wins over this table.
+TELESCOPE_DEFAULTS = {
+    "ATR585M": "RedCat 51",
+}
 SOLVE_LOG = []  # one entry per solver pass on one end of a session, for the statistics at the end
 ASTAP_STRUGGLED = set()  # light folders where ASTAP already failed, so later sessions there try it only once
 # The Linux ASTAP package is the GUI build, which opens a window for every solve. Qt's offscreen
@@ -44,6 +50,7 @@ NIGHT_GAP_HOURS = 3.0  # Sessions this close together on the same instrument cou
 # Mount detection settings
 MOUNT_SAMPLE_FRAMES = 5           # Total frames solved when the two ends are ambiguous
 FIT_TOLERANCE_DEG = 8.0           # A mount type fits if every sampled frame agrees within this
+FLIP_TOLERANCE_DEG = 12.0         # Equatorial fit allowed when a meridian flip is involved (a real GEM flip landed 8.8 deg off 180)
 REJECT_DEG = 2.0                  # The losing mount type must miss by at least this much (solves agree to ~0.3 deg)
 REJECT_RATIO = 3.0                # ...and by at least this multiple of the winner's miss
 MIN_PREDICTED_ROTATION_DEG = 2.0  # Alt-az rotation needed over the session to tell the mounts apart
@@ -242,17 +249,22 @@ def classify_mount(frames, flips=None):
         if flips and more_frames_help and any(abs(abs(d) - 180.0) <= 15.0 for d in observed):
             return "INCONCLUSIVE", evidence + " (end-to-end change is near 180 degrees)", True
 
+        # A real meridian flip does not add exactly 180 degrees (one observed flip added 171.2),
+        # so the equatorial fit gets a wider allowance when a flip is part of the explanation
+        eq_tolerance = FLIP_TOLERANCE_DEG if flips and any(abs(d) > 90.0 for d in observed) else FIT_TOLERANCE_DEG
+
         if equatorial_miss <= altaz_miss:
             winner, winner_miss, loser_miss = "EQUATORIAL", equatorial_miss, altaz_miss
         else:
             winner, winner_miss, loser_miss = "ALT-AZ", altaz_miss, equatorial_miss
 
-        if winner_miss <= FIT_TOLERANCE_DEG and loser_miss >= max(REJECT_DEG, REJECT_RATIO * winner_miss):
+        winner_tolerance = eq_tolerance if winner == "EQUATORIAL" else FIT_TOLERANCE_DEG
+        if winner_miss <= winner_tolerance and loser_miss >= max(REJECT_DEG, REJECT_RATIO * winner_miss):
             return winner, evidence, False
         # More frames only help when both hypotheses fit the ends (for example an alt-az
         # rotation near 180 degrees that looks like a meridian flip)
-        both_fit = equatorial_miss <= FIT_TOLERANCE_DEG and altaz_miss <= FIT_TOLERANCE_DEG
-        neither_fit = equatorial_miss > FIT_TOLERANCE_DEG and altaz_miss > FIT_TOLERANCE_DEG
+        both_fit = equatorial_miss <= eq_tolerance and altaz_miss <= FIT_TOLERANCE_DEG
+        neither_fit = equatorial_miss > eq_tolerance and altaz_miss > FIT_TOLERANCE_DEG
         # When neither fits, frames in between show how the rotation develops during the session
         more = (both_fit and more_frames_help) or (neither_fit and len(frames) < MOUNT_SAMPLE_FRAMES)
         if len(frames) >= 3:
@@ -447,8 +459,14 @@ def extract_header_info(header):
             info['instrument'] = str(header[key]).strip()
             break
 
-    if 'TELESCOP' in header:
-        info['telescope'] = str(header['TELESCOP']).strip()
+    scope = str(header.get('TELESCOP', '')).strip()
+    if scope:
+        info['telescope'] = scope
+    else:
+        for camera, name in TELESCOPE_DEFAULTS.items():
+            if camera.lower() in info['instrument'].lower():
+                info['telescope'] = name
+                break
 
     info['latitude'], info['longitude'] = extract_observatory_location(header)
 
@@ -1014,6 +1032,21 @@ FILTER_FILENAME_PATTERNS = [
 ]
 NO_FILTER_LABEL = "(none)"
 
+# Different capture programs name the same filter differently. These aliases are matched ignoring
+# case, spaces, hyphens and underscores, and are reported under the short name on the left.
+FILTER_ALIASES = {
+    "Ha": ["ha", "halpha", "hydrogenalpha", "hα"],
+    "Oiii": ["oiii", "o3", "oxygeniii", "oxygen3"],
+    "Sii": ["sii", "s2", "sulfurii", "sulphurii", "sulfur2", "sulphur2"],
+}
+_FILTER_LOOKUP = {alias: short for short, aliases in FILTER_ALIASES.items() for alias in aliases}
+
+
+def normalize_filter_name(name):
+    """Report equivalent filter names (Hydrogen Alpha, H-alpha, Ha) under one short name."""
+    key = re.sub(r"[\s_\-.]+", "", name).lower()
+    return _FILTER_LOOKUP.get(key, name)
+
 
 def filter_from_filename(path):
     """Filter name embedded in a file name, or None when the name has no recognized pattern."""
@@ -1021,7 +1054,7 @@ def filter_from_filename(path):
     for pattern in FILTER_FILENAME_PATTERNS:
         match = pattern.search(name)
         if match:
-            return match.group('filter').strip() or NO_FILTER_LABEL
+            return normalize_filter_name(match.group('filter').strip()) or NO_FILTER_LABEL
     return None
 
 
@@ -1031,7 +1064,7 @@ def filter_from_header(header):
         if key in header:
             value = str(header[key]).strip()
             if value:
-                return value
+                return normalize_filter_name(value)
     return NO_FILTER_LABEL
 
 
