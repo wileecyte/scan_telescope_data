@@ -26,9 +26,13 @@ ASTROMETRY_NET_API_KEY = os.environ.get("ASTROMETRY_NET_API_KEY", "")
 MAX_ASTAP_ATTEMPTS = 3  # Files to try with ASTAP at each end of the session before using astrometry.net
 SASP_PATH = os.environ.get("SASP_PATH", os.path.expanduser("~/.local/bin/setiastrosuitepro"))
 SASP_SOLVER = os.environ.get("SASP_SOLVER", "gaia")  # gaia, astap, astrometry or all (all tries ASTAP first)
+SASP_FALLBACK = False  # --sasp-fallback: after SASP fails, continue with ASTAP and astrometry.net
+SASP_FORCE_BLIND = True  # SASPro solves blind; --seeded sends the header position instead
+SASP_BLIND_DIRS = set()  # light folders where the header position was far off, so later frames go blind
+BLIND_OFFSET_DEG = 5.0  # Header position this far from the solved field means the header cannot be trusted
 SASP_ENABLED = False  # --sasp: try Seti Astro Suite Pro first (it falls back to ASTAP/astrometry.net itself)
 SASP_TIMEOUT_SEC = 180
-SASP_MAX_ATTEMPTS = 2
+SASP_MAX_ATTEMPTS = 6  # blind solves are fast, so try several frames before giving up on a session end
 ASTROMETRY_ONLY = False  # --astrometry-only: skip ASTAP (for frames with too few stars, e.g. narrowband filters)
 ASTAP_STRUGGLED = set()  # light folders where ASTAP already failed, so later sessions there try it only once
 ASTAP_TIMEOUT_SEC = 60  # A solve that takes longer than this is abandoned
@@ -156,7 +160,14 @@ def parallactic_angle_deg(ra_deg, dec_deg, lat_deg, lon_deg, obs_time):
     return float(np.degrees(q))
 
 
-def classify_mount(frames):
+def mount_can_flip(header):
+    """False for Seestar scopes: the S50 rotates past the meridian instead of flipping, so a
+    change of about 180 degrees there is alt-az rotation, never a flip. Unknown scopes can flip."""
+    text = f"{header.get('TELESCOP', '')} {header.get('INSTRUME', '')}".upper()
+    return not any(name in text for name in ('S50', 'S30', 'SEESTAR'))
+
+
+def classify_mount(frames, flips=None):
     """Decide the mount type from frames solved across a session.
 
     Frames must be in time order and come from the same solver. Rotation of each frame
@@ -168,14 +179,17 @@ def classify_mount(frames):
 
     Returns (mount_type, evidence, ambiguous). mount_type is EQUATORIAL, ALT-AZ or
     INCONCLUSIVE. ambiguous is True only when solving more frames could help.
+    flips=False (Seestar) removes the meridian-flip case: equatorial then means no change at all.
     """
     if len(frames) < 2:
         return "INCONCLUSIVE", "Fewer than two frames solved, so rotation change is unknown", False
-    if len({f['solver'] for f in frames}) > 1:
+    if len({(f['solver'], f.get('rot_source')) for f in frames}) > 1:
         return ("INCONCLUSIVE",
                 "Frames were solved by different solvers, so their rotations are not comparable", False)
 
     ref = frames[0]
+    if flips is None:
+        flips = mount_can_flip(ref['header'])
     times = [f.get('time') for f in frames]
     have_times = all(t is not None for t in times)
     span_min = (times[-1] - times[0]).to(u.min).value if have_times else None
@@ -183,7 +197,10 @@ def classify_mount(frames):
 
     observed = [wrap180(f['rotation'] - ref['rotation']) for f in frames[1:]]
     # Distance of each observed change from 0 or 180 degrees (a meridian flip adds 180)
-    equatorial_miss = max(abs((d + 90.0) % 180.0 - 90.0) for d in observed)
+    if flips:
+        equatorial_miss = max(abs((d + 90.0) % 180.0 - 90.0) for d in observed)
+    else:
+        equatorial_miss = max(abs(d) for d in observed)
 
     lat, lon = get_site_location(ref['header'])
     if lat is not None and lon is not None and have_times:
@@ -220,7 +237,7 @@ def classify_mount(frames):
 
         # An end-to-end change near 180 degrees is what a meridian flip produces, and an
         # alt-az mount can land there by coincidence. Only frames in between can tell which.
-        if more_frames_help and any(abs(abs(d) - 180.0) <= 15.0 for d in observed):
+        if flips and more_frames_help and any(abs(abs(d) - 180.0) <= 15.0 for d in observed):
             return "INCONCLUSIVE", evidence + " (end-to-end change is near 180 degrees)", True
 
         if equatorial_miss <= altaz_miss:
@@ -527,8 +544,11 @@ def run_sasp_solve(filename, ra_hours=None, dec_degrees=None):
         with tempfile.TemporaryDirectory() as tmp:
             ini_path = os.path.join(tmp, "solve.ini")
             cmd = [SASP_PATH, 'solve', '-i', filename, '--ini-only', '--ini-path', ini_path,
-                   '--solver', SASP_SOLVER, '--pointing', '--quiet']
-            if ra_hours is not None and dec_degrees is not None:
+                   '--solver', SASP_SOLVER, '--pointing']
+            blind = SASP_FORCE_BLIND or os.path.dirname(filename) in SASP_BLIND_DIRS
+            if blind:
+                cmd.append('--force-blind')
+            elif ra_hours is not None and dec_degrees is not None:
                 cmd.extend(['--ra', f"{ra_hours * 15.0:.6f}", '--dec', f"{dec_degrees:.6f}"])
 
             print(f"    Command: {' '.join(cmd)}")
@@ -543,18 +563,20 @@ def run_sasp_solve(filename, ra_hours=None, dec_degrees=None):
                 return None, None
 
             ini = read_astap_ini(ini_path)
+            text = result.stdout + result.stderr
+            # The blind quad search reports centre and roll even when the later refinement step
+            # fails (only a handful of stars on narrowband frames). Taking the roll from that line
+            # whenever it exists keeps every frame measured the same way; the .ini rotation is
+            # used only when the log has no blind line (a seeded solve).
+            hit = re.search(r"Blind: SOLVED.*?RA\s+([\d.]+)°\s+Dec\s+([+-]?[\d.]+)°.*?roll\s+([+-]?[\d.]+)°"
+                            r".*?(\d+) of (\d+) stars matched", text)
+            if hit and int(hit.group(4)) >= 8:
+                ra, dec, rotation = (float(hit.group(i)) for i in (1, 2, 3))
+                print(f"    ✓ Blind solution ({hit.group(4)} of {hit.group(5)} stars matched): "
+                      f"RA={ra:.4f}°, DEC={dec:.4f}°, roll={rotation:.1f}°")
+                return {'ra': ra, 'dec': dec, 'rotation': rotation, 'rot_source': 'blind'}, rotation
+
             if ini.get('PLTSOLVD', 'F').upper() != 'T':
-                # The blind quad search can identify the field and then fail the refinement
-                # step when only a handful of stars were detected (narrowband frames). Its own
-                # solution line still carries centre and roll, so use that.
-                text = result.stdout + result.stderr
-                hit = re.search(r"Blind: SOLVED.*?RA\s+([\d.]+)°\s+Dec\s+([+-]?[\d.]+)°.*?roll\s+([+-]?[\d.]+)°"
-                                r".*?(\d+) of (\d+) stars matched", text)
-                if hit and int(hit.group(4)) >= 8:
-                    ra, dec, rotation = (float(hit.group(i)) for i in (1, 2, 3))
-                    print(f"    ✓ Blind solution used ({hit.group(4)} of {hit.group(5)} stars matched; "
-                          f"refinement failed): RA={ra:.4f}°, DEC={dec:.4f}°, roll={rotation:.1f}°")
-                    return {'ra': ra, 'dec': dec, 'rotation': rotation}, rotation
                 print(f"    ✗ Not solved. {ini.get('ERROR', '')}")
                 for line in text.strip().splitlines()[-4:]:
                     print(f"      output: {line}")
@@ -570,7 +592,7 @@ def run_sasp_solve(filename, ra_hours=None, dec_degrees=None):
                 print(f"    ✗ .ini has neither CROTA2 nor a CD matrix. Keys: {', '.join(sorted(ini))}")
                 return None, None
             print(f"    ✓ Solved: RA={ra:.4f}°, DEC={dec:.4f}°, rotation={rotation:.1f}°")
-            return {'ra': ra, 'dec': dec, 'rotation': rotation}, rotation
+            return {'ra': ra, 'dec': dec, 'rotation': rotation, 'rot_source': 'ini'}, rotation
 
     except subprocess.TimeoutExpired:
         print(f"    ✗ Seti Astro Suite Pro timed out after {SASP_TIMEOUT_SEC} s")
@@ -742,12 +764,14 @@ def solve_frame(path, use_astrometry_net=False, thorough=False, use_sasp=False):
     if ra is not None:
         print(f"  Initial position: RA={ra:.3f}h, DEC={dec:.3f}°")
 
+    rot_source = None
     if use_sasp:
         solution, rotation = run_sasp_solve(path, ra, dec)
         if solution is None:
             print("  → Seti Astro Suite Pro could not plate solve image")
             return None
         solved_ra, solved_dec = solution['ra'], solution['dec']
+        rot_source = solution.get('rot_source')
         solver = "SASPRO"
     elif use_astrometry_net:
         wcs, rotation = run_astrometry_net_solve(path, ra, dec)
@@ -764,8 +788,16 @@ def solve_frame(path, use_astrometry_net=False, thorough=False, use_sasp=False):
         solved_ra, solved_dec = solution['ra'], solution['dec']
         solver = "ASTAP"
 
+    if use_sasp and not SASP_FORCE_BLIND:
+        offset = header_offset_degrees({'header': header, 'ra': solved_ra, 'dec': solved_dec})
+        if offset != '' and offset > BLIND_OFFSET_DEG:
+            if os.path.dirname(path) not in SASP_BLIND_DIRS:
+                print(f"  → Header position is {offset:.0f}° from the solved field; solving the rest of this folder blind")
+            SASP_BLIND_DIRS.add(os.path.dirname(path))
+
     return {
         'file': path,
+        'rot_source': rot_source,
         'solver': solver,
         'ra': solved_ra,
         'dec': solved_dec,
@@ -793,7 +825,7 @@ def solve_end(candidates, label, solver=None):
                 print(f"✅ Solved {label} frame with Seti Astro Suite Pro")
                 return frame, attempts
             print(f"❌ Seti Astro Suite Pro failed on {os.path.basename(path)}")
-        if solver == 'SASPRO':
+        if solver == 'SASPRO' or not SASP_FALLBACK:
             return None, attempts
     use_astap = not (ASTROMETRY_ONLY or solver == 'ASTROMETRY.NET')
     if solver == 'ASTAP':
@@ -1181,18 +1213,27 @@ def pool_inconclusive(results):
         pending = [r for r in group if r['mount_type'] == "INCONCLUSIVE"]
         if not pending or len(group) < 2:
             continue
-        frames = sorted((f for r in group for f in r['frames']), key=frame_sort_key)
-        if len({f['solver'] for f in frames}) > 1:
+        def kind(f):
+            return (f['solver'], f.get('rot_source'))
+        counts = {}
+        for r in group:
+            for f in r['frames']:
+                counts[kind(f)] = counts.get(kind(f), 0) + 1
+        best = max(counts, key=counts.get)
+        group_use = [r for r in group if all(kind(f) == best for f in r['frames'])]
+        pending = [r for r in pending if r in group_use]
+        if not pending or len(group_use) < 2:
             continue
+        frames = sorted((f for r in group_use for f in r['frames']), key=frame_sort_key)
         verdict, evidence, _ = classify_mount(frames)
         if verdict not in ("EQUATORIAL", "ALT-AZ"):
             continue
-        decided = {r['mount_type'] for r in group if r['mount_type'] in ("EQUATORIAL", "ALT-AZ")}
+        decided = {r['mount_type'] for r in group_use if r['mount_type'] in ("EQUATORIAL", "ALT-AZ")}
         if decided - {verdict}:
             continue  # a session from the same night was classified differently
         for r in pending:
             r['mount_type'] = verdict
-            r['mount_evidence'] = f"pooled with {len(group) - 1} other session(s) from the same night: {evidence}"
+            r['mount_evidence'] = f"pooled with {len(group_use) - 1} other session(s) from the same night: {evidence}"
         resolved += len(pending)
     return resolved
 
@@ -1408,13 +1449,23 @@ def group_similar_objects(results):
 
 def parse_args(argv):
     """Return (root paths, CSV file name) from the command line arguments."""
-    global ASTROMETRY_ONLY, SASP_ENABLED
+    global ASTROMETRY_ONLY, SASP_ENABLED, SASP_FALLBACK, SASP_FORCE_BLIND
     roots = []
     csv_name = "telescope_analysis.csv"
     i = 0
     while i < len(argv):
         if argv[i] == "--sasp":
             SASP_ENABLED = True
+            i += 1
+        elif argv[i] == "--blind":
+            SASP_FORCE_BLIND = True
+            i += 1
+        elif argv[i] == "--seeded":
+            SASP_FORCE_BLIND = False
+            i += 1
+        elif argv[i] == "--sasp-fallback":
+            SASP_ENABLED = True
+            SASP_FALLBACK = True
             i += 1
         elif argv[i] == "--astrometry-only":
             ASTROMETRY_ONLY = True
@@ -1431,7 +1482,7 @@ def parse_args(argv):
 def main():
     roots, csv_filename = parse_args(sys.argv[1:])
     if not roots:
-        print("Usage: python scan_telescope_data.py [-o output.csv] [--sasp] [--astrometry-only] <directory_path> [<directory_path> ...]")
+        print("Usage: python scan_telescope_data.py [-o output.csv] [--sasp | --sasp-fallback] [--astrometry-only] <directory_path> [<directory_path> ...]")
         print("Example: python scan_telescope_data.py /home/brian/nina /mnt/nas/astro")
         print("This will walk through all subdirectories and process FITS files")
         print("from each 'light' or 'lights' directory found (any case).")
@@ -1440,7 +1491,9 @@ def main():
         print("from it and comparing how the field rotation changed with what an alt-az mount")
         print("would produce at that site and time. CSV rows are split by filter and exposure.")
         print("\n--sasp solves with Seti Astro Suite Pro first (path: SASP_PATH, default ~/.local/bin/setiastrosuitepro)")
-        print("and falls back to ASTAP/astrometry.net only if it fails.")
+        print("and uses nothing else. --sasp-fallback also tries ASTAP/astrometry.net when it fails.")
+        print("SASPro solves blind by default, ignoring the header position. --seeded sends the header")
+        print("position instead (folders whose header is far off then go blind automatically).")
         print("--astrometry-only skips ASTAP and solves with astrometry.net (needs the API key below).")
         print("Use it for frames with too few stars for ASTAP, such as through a narrowband filter.")
         print("\nOptional environment variables:")
