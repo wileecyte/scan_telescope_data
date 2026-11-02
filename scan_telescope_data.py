@@ -29,7 +29,8 @@ SASP_SOLVER = os.environ.get("SASP_SOLVER", "gaia")  # gaia, astap, astrometry o
 SASP_FALLBACK = False  # --sasp-fallback: after SASP fails, continue with ASTAP and astrometry.net
 SASP_ENABLED = False  # --sasp: try Seti Astro Suite Pro first (it falls back to ASTAP/astrometry.net itself)
 SASP_TIMEOUT_SEC = 180
-SASP_MAX_ATTEMPTS = 4  # frames tried per end in each SASPro mode (blind, then seeded)
+SASP_MAX_ATTEMPTS = 4  # frames tried per end with SASPro blind (1664 blind solves in the archive run: 1650 on try 1, 14 later)
+SASP_SEEDED_ATTEMPTS = 1  # frames tried per end with SASPro seeded (all 18 archive seeded solves came on try 1)
 ASTROMETRY_ONLY = False  # --astrometry-only: skip ASTAP (for frames with too few stars, e.g. narrowband filters)
 SOLVE_LOG = []  # one entry per solver pass on one end of a session, for the statistics at the end
 ASTAP_STRUGGLED = set()  # light folders where ASTAP already failed, so later sessions there try it only once
@@ -827,10 +828,11 @@ def solve_end(candidates, label, solver=None, rot_source=None, mode=None):
         # mode pins one of them, because both ends of a session must be measured the same way.
         for md in ([mode] if mode else ['blind', 'seeded']):
             tried = 0
-            for path in candidates[:SASP_MAX_ATTEMPTS]:
+            limit = SASP_MAX_ATTEMPTS if md == 'blind' else SASP_SEEDED_ATTEMPTS
+            for path in candidates[:limit]:
                 attempts += 1
                 tried += 1
-                print(f"\n🔄 Seti Astro Suite Pro ({md}) attempt {tried}/{min(len(candidates), SASP_MAX_ATTEMPTS)} on {label} frame: {os.path.basename(path)}")
+                print(f"\n🔄 Seti Astro Suite Pro ({md}) attempt {tried}/{min(len(candidates), limit)} on {label} frame: {os.path.basename(path)}")
                 frame = solve_frame(path, use_sasp=True, seeded=(md == 'seeded'))
                 if frame and rot_source and frame.get('rot_source') != rot_source:
                     print(f"  → Skipping: its rotation came from the {frame.get('rot_source')} solution, "
