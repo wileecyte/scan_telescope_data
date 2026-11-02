@@ -1099,6 +1099,21 @@ def process_session(lights_dir, session, index, total):
         if frame_b is not None:
             frames.append(frame_b)
 
+    # SASPro solved one end but not the other: measure both ends with ASTAP instead, since
+    # rotations from different solvers cannot be compared
+    if SASP_ENABLED and SASP_FALLBACK and len(frames) == 1 and frames[0]['solver'] == 'SASPRO':
+        print("\n🔁 Only one end solved with Seti Astro Suite Pro, trying both ends with ASTAP")
+        astap_a, n = solve_end(ordered, "first", solver='ASTAP')
+        attempts += n
+        astap_b = None
+        if astap_a is not None:
+            later = [p for p in reversed(ordered) if p != astap_a['file']]
+            if later:
+                astap_b, n = solve_end(later, "last", solver='ASTAP')
+                attempts += n
+        if astap_a is not None and astap_b is not None:
+            frames = [astap_a, astap_b]
+
     frames.sort(key=frame_sort_key)
 
     if len(frames) >= 2:
