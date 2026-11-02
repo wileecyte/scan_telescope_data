@@ -50,6 +50,8 @@ NIGHT_GAP_HOURS = 3.0  # Sessions this close together on the same instrument cou
 # Mount detection settings
 MOUNT_SAMPLE_FRAMES = 5           # Total frames solved when the two ends are ambiguous
 FIT_TOLERANCE_DEG = 8.0           # A mount type fits if every sampled frame agrees within this
+NEAR_ZENITH_DEG = 10.0            # Closer than this to zenith, the alt-az prediction swings wildly with small errors
+NEAR_ZENITH_TOLERANCE_DEG = 20.0  # Alt-az fit allowed when the target passes that close to zenith (IC 405 passed within 3 deg and missed by 16)
 FLIP_TOLERANCE_DEG = 12.0         # Equatorial fit allowed when a meridian flip is involved (a real GEM flip landed 8.8 deg off 180)
 REJECT_DEG = 2.0                  # The losing mount type must miss by at least this much (solves agree to ~0.3 deg)
 REJECT_RATIO = 3.0                # ...and by at least this multiple of the winner's miss
@@ -169,6 +171,14 @@ def parallactic_angle_deg(ra_deg, dec_deg, lat_deg, lon_deg, obs_time):
     return float(np.degrees(q))
 
 
+def altitude_deg(ra_deg, dec_deg, lat_deg, lon_deg, obs_time):
+    """Altitude above the horizon in degrees (no refraction), same sidereal time model as above."""
+    gmst_deg = 280.46061837 + 360.98564736629 * (obs_time.jd - 2451545.0)
+    hour_angle = np.radians((gmst_deg + lon_deg) % 360.0 - ra_deg)
+    lat, dec = np.radians(lat_deg), np.radians(dec_deg)
+    return float(np.degrees(np.arcsin(np.sin(lat) * np.sin(dec) + np.cos(lat) * np.cos(dec) * np.cos(hour_angle))))
+
+
 def mount_can_flip(header):
     """False for Seestar scopes: the S50 rotates past the meridian instead of flipping, so a
     change of about 180 degrees there is alt-az rotation, never a flip. Unknown scopes can flip."""
@@ -225,6 +235,15 @@ def classify_mount(frames, flips=None):
                     f"alt-az predicts {predicted[-1]:+.1f} deg; worst miss: "
                     f"equatorial {equatorial_miss:.1f} deg, alt-az {altaz_miss:.1f} deg")
 
+        # Near zenith the parallactic angle changes by tens of degrees per minute, so a small
+        # error in site, clock or pointing moves the prediction by 10 to 20 degrees
+        min_zenith_distance = min(90.0 - altitude_deg(f['ra'], f['dec'], lat, lon, f['time']) for f in frames)
+        if min_zenith_distance < NEAR_ZENITH_DEG:
+            altaz_tolerance = NEAR_ZENITH_TOLERANCE_DEG
+            evidence += f" (target passes within {min_zenith_distance:.0f} deg of zenith, so the alt-az prediction is only approximate)"
+        else:
+            altaz_tolerance = FIT_TOLERANCE_DEG
+
         # The prediction at the solved frames can be small even when the session sweeps
         # through a larger angle in between (an alt-az session symmetric about the
         # meridian ends at nearly the angle it started at). Extra frames only help when
@@ -258,13 +277,13 @@ def classify_mount(frames, flips=None):
         else:
             winner, winner_miss, loser_miss = "ALT-AZ", altaz_miss, equatorial_miss
 
-        winner_tolerance = eq_tolerance if winner == "EQUATORIAL" else FIT_TOLERANCE_DEG
+        winner_tolerance = eq_tolerance if winner == "EQUATORIAL" else altaz_tolerance
         if winner_miss <= winner_tolerance and loser_miss >= max(REJECT_DEG, REJECT_RATIO * winner_miss):
             return winner, evidence, False
         # More frames only help when both hypotheses fit the ends (for example an alt-az
         # rotation near 180 degrees that looks like a meridian flip)
-        both_fit = equatorial_miss <= eq_tolerance and altaz_miss <= FIT_TOLERANCE_DEG
-        neither_fit = equatorial_miss > eq_tolerance and altaz_miss > FIT_TOLERANCE_DEG
+        both_fit = equatorial_miss <= eq_tolerance and altaz_miss <= altaz_tolerance
+        neither_fit = equatorial_miss > eq_tolerance and altaz_miss > altaz_tolerance
         # When neither fits, frames in between show how the rotation develops during the session
         more = (both_fit and more_frames_help) or (neither_fit and len(frames) < MOUNT_SAMPLE_FRAMES)
         if len(frames) >= 3:
