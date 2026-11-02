@@ -411,6 +411,7 @@ def extract_header_info(header):
         'filter': 'Unknown',
         'date_obs': 'Unknown',
         'instrument': 'Unknown',
+        'telescope': 'Unknown',
         'latitude': 'Unknown',
         'longitude': 'Unknown'
     }
@@ -445,6 +446,9 @@ def extract_header_info(header):
         if key in header:
             info['instrument'] = str(header[key]).strip()
             break
+
+    if 'TELESCOP' in header:
+        info['telescope'] = str(header['TELESCOP']).strip()
 
     info['latitude'], info['longitude'] = extract_observatory_location(header)
 
@@ -1227,6 +1231,7 @@ def process_session(lights_dir, session, index, total):
         'target': header_info.get('target', 'Unknown'),
         'date': header_info.get('date_obs', 'Unknown'),
         'instrument': header_info.get('instrument', 'Unknown'),
+        'telescope': header_info.get('telescope', 'Unknown'),
         'latitude': header_info.get('latitude', 'Unknown'),
         'longitude': header_info.get('longitude', 'Unknown'),
         'solved_files': solved_files,
@@ -1688,6 +1693,7 @@ def main():
             'Longitude': longitude,
             'Total Files': result['total_files'],
             'Instrument': result.get('instrument', 'Unknown'),
+            'Telescope': result.get('telescope', 'Unknown'),
             'Solved File': ' | '.join(result['solved_files']) if result.get('solved_files') else 'None',
             'Solver Used': result.get('solver_used', 'NONE'),
             'Header Offset (deg)': result.get('header_offset', ''),
@@ -1756,7 +1762,7 @@ def main():
         with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = ['Target', 'Normalized Name', 'Catalog Type', 'Is Mosaic', 'Mosaic Details',
                           'Mount Type', 'Mount Evidence', 'EQMODE', 'Filter', 'Session', 'Date', 'Exposure', 'Frames', 'Integration (h)',
-                          'Directory', 'Latitude', 'Longitude', 'Total Files', 'Instrument',
+                          'Directory', 'Latitude', 'Longitude', 'Total Files', 'Instrument', 'Telescope',
                           'Solved File', 'Solver Used', 'Header Offset (deg)', 'Attempts']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
