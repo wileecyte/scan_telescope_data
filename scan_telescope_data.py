@@ -27,14 +27,14 @@ MAX_ASTAP_ATTEMPTS = 3  # Files to try with ASTAP at each end of the session bef
 SASP_PATH = os.environ.get("SASP_PATH", os.path.expanduser("~/.local/bin/setiastrosuitepro"))
 SASP_SOLVER = os.environ.get("SASP_SOLVER", "gaia")  # gaia, astap, astrometry or all (all tries ASTAP first)
 SASP_FALLBACK = False  # --sasp-fallback: after SASP fails, continue with ASTAP and astrometry.net
-SASP_FORCE_BLIND = True  # SASPro solves blind; --seeded sends the header position instead
-SASP_BLIND_DIRS = set()  # light folders where the header position was far off, so later frames go blind
-BLIND_OFFSET_DEG = 5.0  # Header position this far from the solved field means the header cannot be trusted
 SASP_ENABLED = False  # --sasp: try Seti Astro Suite Pro first (it falls back to ASTAP/astrometry.net itself)
 SASP_TIMEOUT_SEC = 180
-SASP_MAX_ATTEMPTS = 6  # blind solves are fast, so try several frames before giving up on a session end
+SASP_MAX_ATTEMPTS = 4  # frames tried per end in each SASPro mode (blind, then seeded)
 ASTROMETRY_ONLY = False  # --astrometry-only: skip ASTAP (for frames with too few stars, e.g. narrowband filters)
 ASTAP_STRUGGLED = set()  # light folders where ASTAP already failed, so later sessions there try it only once
+# The Linux ASTAP package is the GUI build, which opens a window for every solve. Qt's offscreen
+# platform keeps it from drawing one; set ASTAP_QT_PLATFORM to an empty string to turn that off.
+ASTAP_QT_PLATFORM = os.environ.get("ASTAP_QT_PLATFORM", "offscreen")
 ASTAP_TIMEOUT_SEC = 60  # A solve that takes longer than this is abandoned
 SESSION_GAP_HOURS = 6.0  # A gap this long between frames starts a new observing session
 NIGHT_GAP_HOURS = 3.0  # Sessions this close together on the same instrument count as one night
@@ -183,7 +183,7 @@ def classify_mount(frames, flips=None):
     """
     if len(frames) < 2:
         return "INCONCLUSIVE", "Fewer than two frames solved, so rotation change is unknown", False
-    if len({(f['solver'], f.get('rot_source')) for f in frames}) > 1:
+    if len({(f['solver'], f.get('sasp_mode'), f.get('rot_source')) for f in frames}) > 1:
         return ("INCONCLUSIVE",
                 "Frames were solved by different solvers, so their rotations are not comparable", False)
 
@@ -497,7 +497,10 @@ def run_astap_solve(filename, ra_hours=None, dec_degrees=None, thorough=False):
 
                 print(f"    Command: {' '.join(cmd)}")
                 started = time.time()
-                result = subprocess.run(cmd, capture_output=True, text=True,
+                env = dict(os.environ)
+                if ASTAP_QT_PLATFORM:
+                    env['QT_QPA_PLATFORM'] = ASTAP_QT_PLATFORM
+                result = subprocess.run(cmd, capture_output=True, text=True, env=env,
                                         timeout=ASTAP_TIMEOUT_SEC if hinted else 2 * ASTAP_TIMEOUT_SEC)
                 print(f"    Return code: {result.returncode} ({time.time() - started:.1f} s)")
 
@@ -528,7 +531,7 @@ def run_astap_solve(filename, ra_hours=None, dec_degrees=None, thorough=False):
     return None, None
 
 
-def run_sasp_solve(filename, ra_hours=None, dec_degrees=None):
+def run_sasp_solve(filename, ra_hours=None, dec_degrees=None, seeded=False):
     """Plate solve with Seti Astro Suite Pro's headless solver, read back from its .ini file.
 
     --ini-only writes nothing next to the image. It uses the Gaia solver by default (SASP_SOLVER
@@ -545,8 +548,7 @@ def run_sasp_solve(filename, ra_hours=None, dec_degrees=None):
             ini_path = os.path.join(tmp, "solve.ini")
             cmd = [SASP_PATH, 'solve', '-i', filename, '--ini-only', '--ini-path', ini_path,
                    '--solver', SASP_SOLVER, '--pointing']
-            blind = SASP_FORCE_BLIND or os.path.dirname(filename) in SASP_BLIND_DIRS
-            if blind:
+            if not seeded:
                 cmd.append('--force-blind')
             elif ra_hours is not None and dec_degrees is not None:
                 cmd.extend(['--ra', f"{ra_hours * 15.0:.6f}", '--dec', f"{dec_degrees:.6f}"])
@@ -749,7 +751,7 @@ def run_astrometry_net_solve(filename, ra_hours=None, dec_degrees=None):
         return None, None
 
 
-def solve_frame(path, use_astrometry_net=False, thorough=False, use_sasp=False):
+def solve_frame(path, use_astrometry_net=False, thorough=False, use_sasp=False, seeded=False):
     """Plate solve one frame. Returns a dict with solution, rotation, time and header, or None."""
     print(f"\nProcessing: {os.path.basename(path)}")
     print("-" * 50)
@@ -766,7 +768,7 @@ def solve_frame(path, use_astrometry_net=False, thorough=False, use_sasp=False):
 
     rot_source = None
     if use_sasp:
-        solution, rotation = run_sasp_solve(path, ra, dec)
+        solution, rotation = run_sasp_solve(path, ra, dec, seeded=seeded)
         if solution is None:
             print("  → Seti Astro Suite Pro could not plate solve image")
             return None
@@ -788,16 +790,10 @@ def solve_frame(path, use_astrometry_net=False, thorough=False, use_sasp=False):
         solved_ra, solved_dec = solution['ra'], solution['dec']
         solver = "ASTAP"
 
-    if use_sasp and not SASP_FORCE_BLIND:
-        offset = header_offset_degrees({'header': header, 'ra': solved_ra, 'dec': solved_dec})
-        if offset != '' and offset > BLIND_OFFSET_DEG:
-            if os.path.dirname(path) not in SASP_BLIND_DIRS:
-                print(f"  → Header position is {offset:.0f}° from the solved field; solving the rest of this folder blind")
-            SASP_BLIND_DIRS.add(os.path.dirname(path))
-
     return {
         'file': path,
         'rot_source': rot_source,
+        'sasp_mode': ('seeded' if seeded else 'blind') if use_sasp else None,
         'solver': solver,
         'ra': solved_ra,
         'dec': solved_dec,
@@ -807,7 +803,7 @@ def solve_frame(path, use_astrometry_net=False, thorough=False, use_sasp=False):
     }
 
 
-def solve_end(candidates, label, solver=None):
+def solve_end(candidates, label, solver=None, rot_source=None, mode=None):
     """Find one solvable frame from an ordered list of candidates.
 
     Tries ASTAP on up to MAX_ASTAP_ATTEMPTS candidates, then astrometry.net on one.
@@ -817,14 +813,23 @@ def solve_end(candidates, label, solver=None):
     """
     attempts = 0
     if (SASP_ENABLED and solver is None) or solver == 'SASPRO':
-        for path in candidates[:SASP_MAX_ATTEMPTS]:
-            attempts += 1
-            print(f"\n🔄 Seti Astro Suite Pro attempt {attempts}/{min(len(candidates), SASP_MAX_ATTEMPTS)} on {label} frame: {os.path.basename(path)}")
-            frame = solve_frame(path, use_sasp=True)
-            if frame:
-                print(f"✅ Solved {label} frame with Seti Astro Suite Pro")
-                return frame, attempts
-            print(f"❌ Seti Astro Suite Pro failed on {os.path.basename(path)}")
+        # Blind first (the header position can be wrong), then seeded with the header position.
+        # mode pins one of them, because both ends of a session must be measured the same way.
+        for md in ([mode] if mode else ['blind', 'seeded']):
+            tried = 0
+            for path in candidates[:SASP_MAX_ATTEMPTS]:
+                attempts += 1
+                tried += 1
+                print(f"\n🔄 Seti Astro Suite Pro ({md}) attempt {tried}/{min(len(candidates), SASP_MAX_ATTEMPTS)} on {label} frame: {os.path.basename(path)}")
+                frame = solve_frame(path, use_sasp=True, seeded=(md == 'seeded'))
+                if frame and rot_source and frame.get('rot_source') != rot_source:
+                    print(f"  → Skipping: its rotation came from the {frame.get('rot_source')} solution, "
+                          f"the other end used {rot_source}")
+                    continue
+                if frame:
+                    print(f"✅ Solved {label} frame with Seti Astro Suite Pro ({md})")
+                    return frame, attempts
+                print(f"❌ Seti Astro Suite Pro ({md}) failed on {os.path.basename(path)}")
         if solver == 'SASPRO' or not SASP_FALLBACK:
             return None, attempts
     use_astap = not (ASTROMETRY_ONLY or solver == 'ASTROMETRY.NET')
@@ -1094,10 +1099,26 @@ def process_session(lights_dir, session, index, total):
         later = [p for p in reversed(ordered) if p != frame_a['file']]
         if later:
             print("\n🔧 Solving a frame from the end of the session")
-            frame_b, n = solve_end(later, "last", solver=frame_a['solver'])
+            frame_b, n = solve_end(later, "last", solver=frame_a['solver'], rot_source=frame_a.get('rot_source'),
+                                   mode=frame_a.get('sasp_mode'))
             attempts += n
         if frame_b is not None:
             frames.append(frame_b)
+
+    # Blind found one end only: measure both ends with the header position instead
+    if SASP_ENABLED and len(frames) == 1 and frames[0]['solver'] == 'SASPRO' and frames[0].get('sasp_mode') == 'blind':
+        print("\n🔁 Only one end solved blind, trying both ends seeded with the header position")
+        seeded_a, n = solve_end(ordered, "first", solver='SASPRO', mode='seeded')
+        attempts += n
+        seeded_b = None
+        if seeded_a is not None:
+            later = [p for p in reversed(ordered) if p != seeded_a['file']]
+            if later:
+                seeded_b, n = solve_end(later, "last", solver='SASPRO', mode='seeded',
+                                        rot_source=seeded_a.get('rot_source'))
+                attempts += n
+        if seeded_a is not None and seeded_b is not None:
+            frames = [seeded_a, seeded_b]
 
     # SASPro solved one end but not the other: measure both ends with ASTAP instead, since
     # rotations from different solvers cannot be compared
@@ -1129,7 +1150,8 @@ def process_session(lights_dir, session, index, total):
                 print(f"\n🔧 Solving a frame from the middle of the session (position {idx + 1}/{len(ordered)})")
                 for path in candidates:
                     attempts += 1
-                    mid = solve_frame(path, use_sasp=(frames[0]['solver'] == 'SASPRO'))
+                    mid = solve_frame(path, use_sasp=(frames[0]['solver'] == 'SASPRO'),
+                                      seeded=(frames[0].get('sasp_mode') == 'seeded'))
                     if mid:
                         frames.append(mid)
                         used.add(path)
@@ -1229,7 +1251,7 @@ def pool_inconclusive(results):
         if not pending or len(group) < 2:
             continue
         def kind(f):
-            return (f['solver'], f.get('rot_source'))
+            return (f['solver'], f.get('sasp_mode'), f.get('rot_source'))
         counts = {}
         for r in group:
             for f in r['frames']:
@@ -1464,19 +1486,13 @@ def group_similar_objects(results):
 
 def parse_args(argv):
     """Return (root paths, CSV file name) from the command line arguments."""
-    global ASTROMETRY_ONLY, SASP_ENABLED, SASP_FALLBACK, SASP_FORCE_BLIND
+    global ASTROMETRY_ONLY, SASP_ENABLED, SASP_FALLBACK
     roots = []
     csv_name = "telescope_analysis.csv"
     i = 0
     while i < len(argv):
         if argv[i] == "--sasp":
             SASP_ENABLED = True
-            i += 1
-        elif argv[i] == "--blind":
-            SASP_FORCE_BLIND = True
-            i += 1
-        elif argv[i] == "--seeded":
-            SASP_FORCE_BLIND = False
             i += 1
         elif argv[i] == "--sasp-fallback":
             SASP_ENABLED = True
@@ -1507,8 +1523,7 @@ def main():
         print("would produce at that site and time. CSV rows are split by filter and exposure.")
         print("\n--sasp solves with Seti Astro Suite Pro first (path: SASP_PATH, default ~/.local/bin/setiastrosuitepro)")
         print("and uses nothing else. --sasp-fallback also tries ASTAP/astrometry.net when it fails.")
-        print("SASPro solves blind by default, ignoring the header position. --seeded sends the header")
-        print("position instead (folders whose header is far off then go blind automatically).")
+        print("SASPro solves blind first (the header position can be wrong), then seeded with the header position.")
         print("--astrometry-only skips ASTAP and solves with astrometry.net (needs the API key below).")
         print("Use it for frames with too few stars for ASTAP, such as through a narrowband filter.")
         print("\nOptional environment variables:")
