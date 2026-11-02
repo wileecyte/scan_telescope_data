@@ -31,6 +31,7 @@ SASP_ENABLED = False  # --sasp: try Seti Astro Suite Pro first (it falls back to
 SASP_TIMEOUT_SEC = 180
 SASP_MAX_ATTEMPTS = 4  # frames tried per end in each SASPro mode (blind, then seeded)
 ASTROMETRY_ONLY = False  # --astrometry-only: skip ASTAP (for frames with too few stars, e.g. narrowband filters)
+SOLVE_LOG = []  # one entry per solver pass on one end of a session, for the statistics at the end
 ASTAP_STRUGGLED = set()  # light folders where ASTAP already failed, so later sessions there try it only once
 # The Linux ASTAP package is the GUI build, which opens a window for every solve. Qt's offscreen
 # platform keeps it from drawing one; set ASTAP_QT_PLATFORM to an empty string to turn that off.
@@ -812,6 +813,15 @@ def solve_end(candidates, label, solver=None, rot_source=None, mode=None):
     Returns (frame_or_None, attempts_made).
     """
     attempts = 0
+    mark = [time.time()]
+    folder_name = os.path.dirname(candidates[0]) if candidates else ''
+
+    def record(method, tries, solved):
+        now = time.time()
+        SOLVE_LOG.append({'method': method, 'end': label, 'tries': tries, 'solved': solved,
+                          'seconds': round(now - mark[0], 1), 'folder': folder_name})
+        mark[0] = now
+
     if (SASP_ENABLED and solver is None) or solver == 'SASPRO':
         # Blind first (the header position can be wrong), then seeded with the header position.
         # mode pins one of them, because both ends of a session must be measured the same way.
@@ -828,8 +838,10 @@ def solve_end(candidates, label, solver=None, rot_source=None, mode=None):
                     continue
                 if frame:
                     print(f"✅ Solved {label} frame with Seti Astro Suite Pro ({md})")
+                    record(f"SASPro {md}", tried, True)
                     return frame, attempts
                 print(f"❌ Seti Astro Suite Pro ({md}) failed on {os.path.basename(path)}")
+            record(f"SASPro {md}", tried, False)
         if solver == 'SASPRO' or not SASP_FALLBACK:
             return None, attempts
     use_astap = not (ASTROMETRY_ONLY or solver == 'ASTROMETRY.NET')
@@ -842,14 +854,18 @@ def solve_end(candidates, label, solver=None, rot_source=None, mode=None):
         folder = os.path.dirname(candidates[0])
         limit = 1 if folder in ASTAP_STRUGGLED else MAX_ASTAP_ATTEMPTS
         astap_candidates = candidates[:limit]
+        astap_tries = 0
         for path in astap_candidates:
             attempts += 1
-            print(f"\n🔄 ASTAP attempt {attempts}/{len(astap_candidates)} on {label} frame: {os.path.basename(path)}")
-            frame = solve_frame(path, thorough=(attempts == 1))
+            astap_tries += 1
+            print(f"\n🔄 ASTAP attempt {astap_tries}/{len(astap_candidates)} on {label} frame: {os.path.basename(path)}")
+            frame = solve_frame(path, thorough=(astap_tries == 1))
             if frame:
                 print(f"✅ Solved {label} frame with ASTAP")
+                record("ASTAP", astap_tries, True)
                 return frame, attempts
             print(f"❌ ASTAP failed on {os.path.basename(path)}")
+        record("ASTAP", astap_tries, False)
         ASTAP_STRUGGLED.add(folder)
         if use_astap_only:
             return None, attempts
@@ -862,7 +878,9 @@ def solve_end(candidates, label, solver=None, rot_source=None, mode=None):
         frame = solve_frame(path, use_astrometry_net=True)
         if frame:
             print(f"✅ Solved {label} frame with astrometry.net")
+            record("astrometry.net", 1, True)
             return frame, attempts
+        record("astrometry.net", 1, False)
         print("❌ astrometry.net also failed")
     elif candidates:
         print("\n❌ No astrometry.net API key set (ASTROMETRY_NET_API_KEY), so there is no fallback solver")
@@ -1215,6 +1233,52 @@ def process_session(lights_dir, session, index, total):
         'attempts_made': attempts,
         'total_attempts': len(session)
     }
+
+
+def solve_statistics(csv_filename=None):
+    """Print how many frames each solver pass needed, and write the raw log next to the CSV.
+
+    Use the 'success after' counts to pick how many frames per end are worth trying.
+    """
+    if not SOLVE_LOG:
+        return
+    groups = {}
+    for entry in SOLVE_LOG:
+        groups.setdefault(entry['method'], []).append(entry)
+
+    print("\n📈 Solve statistics (one line per solver pass on one end of a session)")
+    for method, entries in groups.items():
+        solved = [e for e in entries if e['solved']]
+        failed = [e for e in entries if not e['solved']]
+        histogram = {}
+        for e in solved:
+            histogram[e['tries']] = histogram.get(e['tries'], 0) + 1
+        by_try = ", ".join(f"try {k}: {v}" for k, v in sorted(histogram.items())) or "none"
+        wasted = sum(e['seconds'] for e in failed)
+        solved_seconds = sum(e['seconds'] for e in solved)
+        print(f"  {method:16s} {len(entries):4d} passes, {len(solved)} solved "
+              f"({100.0 * len(solved) / len(entries):.0f}%); solved on {by_try}")
+        print(f"  {'':16s} time: {solved_seconds:.0f} s on passes that solved, {wasted:.0f} s on {len(failed)} that failed")
+        if histogram:
+            total = sum(histogram.values())
+            running = 0
+            for k in sorted(histogram):
+                running += histogram[k]
+                if running >= 0.99 * total:
+                    print(f"  {'':16s} {running}/{total} solves came within {k} frame(s) per end")
+                    break
+
+    if csv_filename:
+        base, _ = os.path.splitext(csv_filename)
+        stats_path = base + "_solve_stats.csv"
+        try:
+            with open(stats_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=['method', 'end', 'tries', 'solved', 'seconds', 'folder'])
+                writer.writeheader()
+                writer.writerows(SOLVE_LOG)
+            print(f"  Solve log saved to: {stats_path}")
+        except OSError as e:
+            print(f"  Could not write {stats_path}: {e}")
 
 
 def pool_inconclusive(results):
@@ -1699,6 +1763,7 @@ def main():
                 writer.writerow(row)
 
         print(f"\n✅ Results saved to: {csv_filename}")
+        solve_statistics(csv_filename)
         print(f"📊 Total records: {len(all_rows)}")
 
         total_dirs_with_files = len(results)
