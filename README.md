@@ -1,4 +1,4 @@
-# scan_telescope_data
+# Scan Telescope Data
 
 A Python script that walks a tree of astrophotography data, plate solves a few light frames from each observing session, and works out whether the session was shot on an equatorial (EQ) or alt-azimuth (alt-az) mount. It also tallies targets, filters, exposures and integration time. Results go to a CSV file, one row per session, filter and exposure.
 
