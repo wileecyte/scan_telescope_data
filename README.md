@@ -155,9 +155,29 @@ All of the NINA data scanned to date (ATR585M and ASCOM ToupTek cameras, Februar
 - Sidereal time is computed from the Julian date without IERS data. That is accurate to well under a second, which is plenty here.
 - Very short sessions rarely rotate enough to separate the mounts and often come back inconclusive unless pooling resolves them.
 
-## History
+## Revision history
 
-The commit history was reconstructed from saved revisions of the script, so each commit is one of those revisions.
+The commit history was reconstructed from saved revisions of the script, so each `Revision NN` commit is one of those revisions. Revision 11 was not saved, so the history goes from Revision 10 to Revision 12.
+
+| Revision | Change |
+|---|---|
+| 01 | Initial version. Solves up to 3 frames per light folder with ASTAP, falls back to one frame on astrometry.net, and guesses the mount from a single frame's rotation (within 10 degrees of 0 or 180 means equatorial, anything else alt-az). Includes object name normalization, mosaic detection, exposure counts and the CSV. |
+| 02 | Detects the mount from how the rotation changes between a start frame and an end frame. Alt-az rotation is predicted from the parallactic angle using the site location (headers, or `SITE_LATITUDE` and `SITE_LONGITUDE`). Adds a no-location fallback that needs a 30 minute span. |
+| 03 | Solves up to 5 frames across the session when the start and end can't separate the two hypotheses. Accepts either rotation sign and adds the fit and reject thresholds. |
+| 04 | Splits sessions at gaps of 6 hours or more. Orders frames by the timestamp in Seestar and NINA file names, deprioritizes frames marked `failed`, adds a 60 second ASTAP timeout, and checks mid-session swings in the predicted rotation. |
+| 05 | Classifies each filter separately, taking the filter from the file name or the FITS header. Each directory is processed as individual sessions. |
+| 06 | Tunes the thresholds: reject margin 2 degrees, minimum predicted rotation 2 degrees, and a 6 degree sweep threshold for solving extra frames. This revision classified the short alt-az Seestar session that earlier values missed. |
+| 07 | Adds `-o`/`--output` and support for several root directories. Reports directories that `os.walk` can't read instead of skipping them silently. |
+| 08 | Cross-checks the rotation verdict against the Seestar `EQMODE` header. Re-judges inconclusive sessions together with others from the same night and instrument. Adds a thorough first ASTAP attempt and logs why a solve failed. |
+| 09 | Adds Seti Astro Suite Pro as a solver (`--sasp`) and `--astrometry-only`. ASTAP's last retry now ignores the header position and searches the whole sky, for headers that are far off. Reports how far the header position was from the solved field, and folders where ASTAP already failed get a single attempt. |
+| 10 | Adds `--sasp-fallback`, which continues with ASTAP and astrometry.net after SASPro fails. SASPro solves blind by default. Seestar scopes are never treated as meridian-flip mounts, and pooling only combines sessions measured the same way. |
+| 12 | When SASPro solves only one end of a session, both ends are redone with ASTAP, since rotations from different solvers can't be compared. |
+| 13 | SASPro now tries blind and then seeded automatically, and the `--blind` and `--seeded` flags are gone. If only one end solves blind, both ends are retried seeded. The Linux ASTAP GUI build runs on Qt's offscreen platform (`ASTAP_QT_PLATFORM`). |
+| 14 | Adds solve statistics: a tries-to-success histogram per solver at the end of a run, and a `_solve_stats.csv` log next to the main CSV. |
+| 15 | Sets the SASPro attempt limits from archive data: 4 blind tries and 1 seeded try per end (1650 of 1664 blind solves came on the first try). |
+| 16 | Adds the Telescope column, read from the `TELESCOP` header. |
+| 17 | Adds the `TELESCOPE_DEFAULTS` table for headers with no telescope name, a wider 12 degree tolerance for real meridian flips (one added 171.2 degrees), and filter aliases so Ha, Oiii and Sii variants report under one name. |
+| 18 | Allows a wider alt-az tolerance (20 degrees) for targets that pass within 10 degrees of zenith. IC 405 passed within 3 degrees and missed the prediction by 16. |
 
 ## License
 
